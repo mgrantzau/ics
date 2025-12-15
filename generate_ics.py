@@ -13,9 +13,8 @@ MONTHS = {
     "jul.": 7, "aug.": 8, "sep.": 9, "okt.": 10, "nov.": 11, "dec.": 12
 }
 
-def parse_date_token(day: int, month_abbr: str, year_hint: int) -> datetime:
-    m = MONTHS[month_abbr]
-    return datetime(year_hint, m, day)
+def parse_date(day: int, month_abbr: str, year_hint: int) -> datetime:
+    return datetime(year_hint, MONTHS[month_abbr], day)
 
 def ics_dt(dt: datetime) -> str:
     return dt.strftime("%Y%m%dT%H%M%S")
@@ -40,8 +39,10 @@ def main():
     text = soup.get_text("\n")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    date_re = re.compile(r"^(mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(\d{1,2})\.\s+([a-zæøå]+\.)$",
-                         re.IGNORECASE)
+    date_re = re.compile(
+        r"^(mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(\d{1,2})\.\s+([a-zæøå]+\.)$",
+        re.IGNORECASE
+    )
     time_re = re.compile(r"^kl\.\s*(\d{1,2}):(\d{2})$", re.IGNORECASE)
     on_re = re.compile(r"^afspilles på\s+(.+)$", re.IGNORECASE)
 
@@ -63,11 +64,12 @@ def main():
                 i += 1
                 continue
 
+            # Year rollover (dec -> jan)
             if last_month is not None and mon < last_month:
                 year_hint += 1
             last_month = mon
 
-            current_date = parse_date_token(day, mon_abbr, year_hint)
+            current_date = parse_date(day, mon_abbr, year_hint)
             i += 1
             continue
 
@@ -76,12 +78,16 @@ def main():
             hh = int(mtime.group(1))
             mm = int(mtime.group(2))
             start = datetime(current_date.year, current_date.month, current_date.day, hh, mm, 0)
+            end = start + timedelta(minutes=DURATION_MIN)
 
-            match_line = lines[i+1] if i+1 < len(lines) else ""
-            competition_line = lines[i+2] if i+2 < len(lines) else ""
+            # Kamp-linjen forventes lige efter tidspunkt
+            summary = lines[i + 1] if i + 1 < len(lines) else ""
 
+            # Saml “noter” indtil vi møder “afspilles på …” eller næste dato/tid
+            notes_parts = []
             location = ""
-            j = i + 3
+
+            j = i + 2
             while j < len(lines):
                 if date_re.match(lines[j]) or time_re.match(lines[j]):
                     break
@@ -89,10 +95,12 @@ def main():
                 if mon_line:
                     location = mon_line.group(1).strip()
                     break
+                notes_parts.append(lines[j])
                 j += 1
 
-            end = start + timedelta(minutes=DURATION_MIN)
-            events.append((start, end, match_line, competition_line, location))
+            notes = "\n".join(notes_parts).strip()
+
+            events.append((start, end, summary, location, notes))
             i += 1
             continue
 
@@ -128,7 +136,7 @@ END:VTIMEZONE
     out.append("METHOD:PUBLISH")
     out.append(vtimezone.strip())
 
-    for start, end, summary, desc, location in events:
+    for start, end, summary, location, notes in events:
         out.append("BEGIN:VEVENT")
         out.append(f"UID:{uuid.uuid4()}@mgrantzau-ics")
         out.append(f"DTSTAMP:{dtstamp}")
@@ -137,8 +145,8 @@ END:VTIMEZONE
         out.append(f"SUMMARY:{esc(summary)}")
         if location:
             out.append(f"LOCATION:{esc(location)}")
-        if desc:
-            out.append(f"DESCRIPTION:{esc(desc)}")
+        if notes:
+            out.append(f"DESCRIPTION:{esc(notes)}")
         out.append("END:VEVENT")
 
     out.append("END:VCALENDAR")
