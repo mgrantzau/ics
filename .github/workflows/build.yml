@@ -3,7 +3,7 @@ name: Build and publish ICS
 on:
   workflow_dispatch:
   schedule:
-  - cron: "15 6,18 * * *"
+    - cron: "15 6,18 * * *"
   
 permissions:
   contents: write
