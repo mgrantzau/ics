@@ -28,6 +28,11 @@ def esc(s: str) -> str:
              .replace(",", "\\,")
              .replace(";", "\\;"))
 
+def stable_uid(start: datetime, summary: str) -> str:
+    # Stabil UID pr. event => undgår dubletter ved refresh
+    key = f"{start.strftime('%Y%m%dT%H%M')};{summary.strip()}"
+    return f"{uuid.uuid5(uuid.NAMESPACE_URL, key)}@chatgpt.local"
+
 def main():
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; mgrantzau-ics/1.0; +https://github.com/mgrantzau/ics)",
@@ -44,14 +49,11 @@ def main():
     text = soup.get_text("\n")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    # Example: "tirsdag 16. dec."
     date_re = re.compile(
         r"^(mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(\d{1,2})\.\s+([a-zæøå]+\.)$",
         re.IGNORECASE
     )
-    # Example: "kl. 18:30"
     time_re = re.compile(r"^kl\.\s*(\d{1,2}):(\d{2})$", re.IGNORECASE)
-    # Example: "afspilles på TV2 Sport"
     on_re = re.compile(r"^afspilles på\s+(.+)$", re.IGNORECASE)
 
     # Kamp-linje (tolerant): "Hold A - Hold B" eller "Hold A – Hold B"
@@ -60,7 +62,6 @@ def main():
     events = []
     current_date = None
 
-    # Year rollover heuristic (dec -> jan)
     now = datetime.now()
     year_hint = now.year
     last_month = None
@@ -96,9 +97,6 @@ def main():
             location = ""
             notes_parts = []
 
-            # Scan frem til næste dato/tid og find:
-            # - første kamp-linje => SUMMARY
-            # - "afspilles på ..." => LOCATION
             j = i + 1
             while j < len(lines):
                 if date_re.match(lines[j]) or time_re.match(lines[j]):
@@ -119,11 +117,9 @@ def main():
 
             notes = "\n".join([p for p in notes_parts if p]).strip()
 
-            # Kun opret event hvis vi fandt en kamp-linje
             if summary:
                 events.append((start, end, summary, location, notes))
 
-            # Spring forbi hele blokken vi lige har behandlet
             i = j
             continue
 
@@ -161,7 +157,7 @@ END:VTIMEZONE
 
     for start, end, summary, location, notes in events:
         out.append("BEGIN:VEVENT")
-        out.append(f"UID:{uuid.uuid4()}@chatgpt.local")
+        out.append(f"UID:{stable_uid(start, summary)}")
         out.append(f"DTSTAMP:{dtstamp}")
         out.append(f"DTSTART;TZID={TZID}:{ics_dt(start)}")
         out.append(f"DTEND;TZID={TZID}:{ics_dt(end)}")
