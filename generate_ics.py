@@ -16,43 +16,82 @@ MONTHS = {
     "jul.": 7, "aug.": 8, "sep.": 9, "okt.": 10, "nov.": 11, "dec.": 12
 }
 
-def ics_dt(dt):
-    return dt.strftime("%Y%m%dT%H%M%S")
-
-def esc(s: str) -> str:
-    return (s.replace("\\", "\\\\")
-             .replace("\r\n", "\n")
-             .replace("\r", "\n")
-             .replace("\n", "\\n")
-             .replace(",", "\\,")
-             .replace(";", "\\;"))
-
-def stable_uid(start, summary: str) -> str:
-    key = f"{start.strftime('%Y%m%dT%H%M')};{summary.strip()}"
-    return f"{uuid.uuid5(uuid.NAMESPACE_URL, key)}@chatgpt.local"
+# Kanaler vi accepterer (udvid hvis du vil)
+CHANNELS = [
+    "TV2 Sport",
+    "TV2 Play",
+    "TV2",
+    "DR1",
+    "DR2",
+    "TV3 Sport",
+]
 
 def norm(s: str) -> str:
     return " ".join(s.replace("\u00a0", " ").split()).strip()
 
-# Whitelist over kanaler vi accepterer som location
-CHANNEL_PATTERNS = [
-    r"TV2\s*Sport",
-    r"TV2\s*Play",
-    r"TV2\b",
-    r"DR1\b",
-    r"DR2\b",
-    r"TV3\s*Sport",
-]
+def ics_dt(dt: datetime) -> str:
+    return dt.strftime("%Y%m%dT%H%M%S")
 
-channel_re = re.compile(r"^(?:" + "|".join(CHANNEL_PATTERNS) + r")$", re.IGNORECASE)
+def esc(s: str) -> str:
+    return (s.replace("\\", "\\\\")
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\n", "\\n")
+            .replace(",", "\\,")
+            .replace(";", "\\;"))
 
-def extract_channel_fallback(text_lines):
+def stable_uid(start: datetime, summary: str) -> str:
+    key = f"{start.strftime('%Y%m%dT%H%M')};{summary.strip()}"
+    return f"{uuid.uuid5(uuid.NAMESPACE_URL, key)}@chatgpt.local"
+
+# Regex der finder kanal som substring (case-insensitive)
+channel_anywhere_re = re.compile(
+    r"(TV2\s*Sport|TV2\s*Play|TV2\b|DR1\b|DR2\b|TV3\s*Sport)",
+    re.IGNORECASE
+)
+
+# Regex der finder "afspilles på <kanal>" i en samlet tekststreng
+afspilles_re = re.compile(r"afspilles\s*p[åa]\s*(.+)$", re.IGNORECASE)
+
+def extract_channel_from_block(block_lines) -> str:
     """
-    Finder første linje der ligner en kanal (fx 'TV2 Sport') og returnerer den.
+    Prøv at udlede kanal fra en event-blok.
+    Returnerer '' hvis intet findes.
     """
-    for ln in text_lines:
-        if channel_re.match(ln):
-            return ln
+    # 1) Direkte: "afspilles på TV2 Sport" (samme linje)
+    for ln in block_lines:
+        m = afspilles_re.search(ln)
+        if m:
+            tail = norm(m.group(1))
+            # tail kan være "TV2 Sport" eller noget længere
+            m2 = channel_anywhere_re.search(tail)
+            if m2:
+                return norm(m2.group(1))
+
+    # 2) Split: "afspilles" + "på" + "TV2 Sport"
+    for idx, ln in enumerate(block_lines):
+        if ln.lower() == "afspilles":
+            # næste linje kan være "på"
+            if idx + 1 < len(block_lines) and block_lines[idx + 1].lower() in ("på", "pa"):
+                # næste igen kan være kanal
+                if idx + 2 < len(block_lines):
+                    m = channel_anywhere_re.search(block_lines[idx + 2])
+                    if m:
+                        return norm(m.group(1))
+
+        # Split: "afspilles på" (uden kanal) + næste linje kanal
+        if ln.lower() in ("afspilles på", "afspilles pa"):
+            if idx + 1 < len(block_lines):
+                m = channel_anywhere_re.search(block_lines[idx + 1])
+                if m:
+                    return norm(m.group(1))
+
+    # 3) Fallback: find kanal hvor som helst i blokken (substring)
+    for ln in block_lines:
+        m = channel_anywhere_re.search(ln)
+        if m:
+            return norm(m.group(1))
+
     return ""
 
 def main():
@@ -76,10 +115,6 @@ def main():
         re.IGNORECASE
     )
     time_re = re.compile(r"^kl\.\s*(\d{1,2}):(\d{2})$", re.IGNORECASE)
-
-    on_re_inline = re.compile(r"^afspilles på\s+(.+)$", re.IGNORECASE)
-    on_re_bare = re.compile(r"^afspilles på$", re.IGNORECASE)
-
     match_re = re.compile(r".+\s[–-]\s.+")  # "Hold A - Hold B" / "Hold A – Hold B"
 
     events = []
@@ -117,7 +152,6 @@ def main():
             end = start + timedelta(minutes=DURATION_MIN)
 
             summary = ""
-            location = ""
             notes_parts = []
             block_lines = []
 
@@ -126,26 +160,9 @@ def main():
                 if date_re.match(lines[j]) or time_re.match(lines[j]):
                     break
 
-                # Gem hele blokken til fallback-detektion
                 block_lines.append(lines[j])
 
-                # Kanal (inline)
-                m_inline = on_re_inline.match(lines[j])
-                if m_inline:
-                    location = m_inline.group(1).strip()
-                    j += 1
-                    break
-
-                # Kanal (split)
-                if on_re_bare.match(lines[j]):
-                    if j + 1 < len(lines) and not (date_re.match(lines[j+1]) or time_re.match(lines[j+1])):
-                        location = lines[j + 1].strip()
-                        j += 2
-                    else:
-                        j += 1
-                    break
-
-                # Første kamp-linje bliver SUMMARY, resten bliver noter
+                # første kamp-linje bliver SUMMARY
                 if (not summary) and match_re.match(lines[j]):
                     summary = lines[j]
                 else:
@@ -153,11 +170,20 @@ def main():
 
                 j += 1
 
-            # Fallback: hvis vi ikke fandt location via "afspilles på"
-            if not location:
-                location = extract_channel_fallback(block_lines)
+            location = extract_channel_from_block(block_lines)
 
-            notes = "\n".join([p for p in notes_parts if p]).strip()
+            # Fjern “afspilles / på / kanal” fra noter hvis de ligger der
+            cleaned_notes = []
+            skip_set = {"afspilles", "på", "pa", "afspilles på", "afspilles pa"}
+            for ln in notes_parts:
+                if ln.lower() in skip_set:
+                    continue
+                # hvis linjen bare er kanalen, så drop den fra noter (nu står den i location)
+                if location and norm(ln).lower() == location.lower():
+                    continue
+                cleaned_notes.append(ln)
+
+            notes = "\n".join([p for p in cleaned_notes if p]).strip()
 
             if summary:
                 events.append((start, end, summary, location, notes))
