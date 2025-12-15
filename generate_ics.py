@@ -1,11 +1,8 @@
 # generate_ics.py
-# Endelig version:
-# - Henter og render siden med Playwright (så JS-indhold kommer med)
-# - Opretter kun events for kampe (ingen turnerings-dubletter)
-# - LOCATION = kanal (TV2/DR/TV3 osv.)
-# - DESCRIPTION = øvrige oplysninger (turnering/liga m.m.)
-#
-# Output: docs/tv-program.ics
+# Fix v3:
+# - Ingen dubletter: turneringslinjer med "-" bliver ikke behandlet som kamp
+# - LOCATION findes via både tekst og HTML-fallback nær tidspunktet (Playwright-render)
+# - DESCRIPTION = øvrige info
 
 import os
 import re
@@ -18,7 +15,7 @@ from playwright.sync_api import sync_playwright
 URL = "https://danskhaandbold.dk/tv-program"
 TZID = "Europe/Copenhagen"
 DURATION_MIN = 90
-SCRIPT_VERSION = "2025-12-15-playwright-final-v2"
+SCRIPT_VERSION = "2025-12-15-playwright-final-v3"
 
 MONTHS = {
     "jan.": 1, "feb.": 2, "mar.": 3, "apr.": 4, "maj": 5, "jun.": 6,
@@ -30,12 +27,20 @@ DATE_RE = re.compile(
     re.IGNORECASE
 )
 TIME_RE = re.compile(r"^kl\.\s*(\d{1,2}):(\d{2})$", re.IGNORECASE)
-ONE_LINE_MATCH_RE = re.compile(r".+\s[–-]\s.+")
 
 CHANNEL_RE = re.compile(
     r"(TV2\s*Sport|TV2\s*Play|TV2\b|DR1\b|DR2\b|TV3\s*Sport)",
     re.IGNORECASE
 )
+
+# Linjer der typisk er turnering/liga og IKKE et kampnavn
+COMPETITION_RE = re.compile(
+    r"(Pokalturnering|Bambuni|Champions League|Golden League|Final4|gruppespil|Herrer|Kvinder)",
+    re.IGNORECASE
+)
+
+# Kampnavne er sjældent fyldt med tal/år eller 1/4 osv.
+BAD_MATCH_TOKENS_RE = re.compile(r"(\b20\d{2}\b|\d+/\d+|\b1/2\b|\b1/4\b|\b1/8\b)", re.IGNORECASE)
 
 FOOTER_STOP_RE = re.compile(
     r"(Besøg Landsholdshoppen|CVR nummer|danskhaandbold@danskhaandbold\.dk|DanskHåndbold 2025|GDPR|Boozt\.com)",
@@ -60,19 +65,16 @@ def stable_uid(start: datetime, summary: str) -> str:
     key = f"{start.strftime('%Y%m%dT%H%M')};{summary.strip()}"
     return f"{uuid.uuid5(uuid.NAMESPACE_URL, key)}@chatgpt.local"
 
-def fetch_rendered_lines() -> list[str]:
-    """
-    Render siden med Playwright for at få indhold der ellers kan være JS-genereret.
-    """
+def fetch_rendered_html_and_lines() -> tuple[str, list[str]]:
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
         page.goto(URL, wait_until="networkidle", timeout=60000)
 
-        # hjælper hvis der lazy-loades
-        page.mouse.wheel(0, 4000)
+        # hjælper ved lazy-load
+        page.mouse.wheel(0, 5000)
         page.wait_for_timeout(800)
-        page.mouse.wheel(0, 4000)
+        page.mouse.wheel(0, 5000)
         page.wait_for_timeout(800)
 
         html = page.content()
@@ -80,17 +82,24 @@ def fetch_rendered_lines() -> list[str]:
 
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text("\n")
-    return [norm(ln) for ln in text.splitlines() if norm(ln)]
+    lines = [norm(ln) for ln in text.splitlines() if norm(ln)]
+    return html, lines
 
-def extract_channel(block: list[str]) -> str:
+def looks_like_real_match_line(line: str) -> bool:
     """
-    Finder kanal i blokken, uanset om den står som:
-      - "afspilles på TV2 Sport" (samme linje)
-      - "afspilles", "på", "TV2 Sport" (splittet)
-      - "afspilles på" + næste linje kanal
-      - eller kanal optræder som substring i en linje
+    Sand hvis linjen ligner "Hold A - Hold B" (eller med –),
+    og ikke ligner turnering/liga (med år, 1/4-finaler osv.).
     """
-    # 1) "afspilles på <kanal>" samme linje
+    if not re.search(r".+\s[–-]\s.+", line):
+        return False
+    if COMPETITION_RE.search(line):
+        return False
+    if BAD_MATCH_TOKENS_RE.search(line):
+        return False
+    return True
+
+def extract_channel_from_block(block: list[str]) -> str:
+    # 1) "afspilles på <...>" samme linje
     for ln in block:
         m = re.search(r"afspilles\s*p[åa]\s*(.+)$", ln, flags=re.IGNORECASE)
         if m:
@@ -108,7 +117,6 @@ def extract_channel(block: list[str]) -> str:
                     if m:
                         return norm(m.group(1))
 
-        # split: "afspilles på" + næste linje
         if low in ("afspilles på", "afspilles pa"):
             if i + 1 < len(block):
                 m = CHANNEL_RE.search(block[i + 1])
@@ -123,19 +131,29 @@ def extract_channel(block: list[str]) -> str:
 
     return ""
 
+def extract_channel_from_html_near_time(rendered_html: str, hh: int, mm: int) -> str:
+    """
+    Fallback: find kanal i HTML tæt på tidspunktet HH:MM.
+    Det fanger cases hvor kanal ikke kommer med i soup.get_text().
+    """
+    anchor = f"{hh:02d}:{mm:02d}"
+    pos = rendered_html.find(anchor)
+    if pos == -1:
+        return ""
+    window = rendered_html[pos:pos + 25000]
+    m = CHANNEL_RE.search(window)
+    return norm(m.group(1)) if m else ""
+
 def extract_match_summary_and_notes(block: list[str]) -> tuple[str, str]:
     """
     Returnerer (SUMMARY, NOTES).
-    SUMMARY bygges kun hvis vi kan lave en kamp:
-      - "Hold A - Hold B" (én linje)
-      - "Hold A", "-", "Hold B" (tre linjer)
-    NOTES = alt andet (minus "afspilles/på/kanal-linje")
+    SUMMARY oprettes kun hvis vi kan finde et rigtigt kampnavn.
     """
     summary = ""
 
     # 1) én-linjers kamp
     for ln in block:
-        if ONE_LINE_MATCH_RE.match(ln):
+        if looks_like_real_match_line(ln):
             summary = ln
             break
 
@@ -145,14 +163,17 @@ def extract_match_summary_and_notes(block: list[str]) -> tuple[str, str]:
     if not summary:
         for i in range(1, len(block) - 1):
             if block[i] == "-" and block[i - 1] and block[i + 1]:
-                summary = f"{block[i - 1]} - {block[i + 1]}"
-                used_three = {i - 1, i, i + 1}
-                break
+                candidate = f"{block[i - 1]} - {block[i + 1]}"
+                if looks_like_real_match_line(candidate):
+                    summary = candidate
+                    used_three = {i - 1, i, i + 1}
+                    break
 
     if not summary:
         return "", "\n".join(block).strip()
 
-    channel = extract_channel(block)
+    # NOTES: alt andet end selve match-navnet (+ fjern "afspilles/på/kanal")
+    channel = extract_channel_from_block(block)
     skip_set = {"afspilles", "på", "pa", "afspilles på", "afspilles pa"}
 
     notes_parts = []
@@ -163,7 +184,6 @@ def extract_match_summary_and_notes(block: list[str]) -> tuple[str, str]:
             continue
         if ln.lower() in skip_set:
             continue
-        # hvis linjen bare er kanalen, drop den fra noter (den kommer i LOCATION)
         if channel and norm(ln).lower() == channel.lower():
             continue
         notes_parts.append(ln)
@@ -220,7 +240,7 @@ END:VTIMEZONE
     return "\r\n".join(out) + "\r\n"
 
 def main():
-    lines = fetch_rendered_lines()
+    html, lines = fetch_rendered_html_and_lines()
 
     events_map = {}  # (start, summary) -> (end, location, notes)
     current_date = None
@@ -240,7 +260,6 @@ def main():
                 i += 1
                 continue
 
-            # årsskifte (dec -> jan)
             if last_month is not None and month < last_month:
                 year_hint += 1
             last_month = month
@@ -257,7 +276,6 @@ def main():
             start = datetime(current_date.year, current_date.month, current_date.day, hh, mm, 0)
             end = start + timedelta(minutes=DURATION_MIN)
 
-            # saml blok indtil næste tid/dato eller footer
             block = []
             j = i + 1
             while j < len(lines):
@@ -272,7 +290,12 @@ def main():
 
             summary, notes = extract_match_summary_and_notes(block)
             if summary:
-                location = extract_channel(block)
+                location = extract_channel_from_block(block)
+                if not location:
+                    location = extract_channel_from_html_near_time(html, hh, mm)
+
+                # Dedup ekstra hårdt: hvis vi allerede har et event på samme tid,
+                # behold den med "Hold A - Hold B" (denne) og overskriv ikke med noget dårligere.
                 events_map[(start, summary)] = (end, location, notes)
 
             i = j
@@ -280,7 +303,6 @@ def main():
 
         i += 1
 
-    # sortér events
     events = []
     for (start, summary), (end, location, notes) in sorted(events_map.items(), key=lambda x: (x[0][0], x[0][1])):
         events.append((start, end, summary, location, notes))
