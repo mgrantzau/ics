@@ -31,9 +31,29 @@ def stable_uid(start, summary: str) -> str:
     key = f"{start.strftime('%Y%m%dT%H%M')};{summary.strip()}"
     return f"{uuid.uuid5(uuid.NAMESPACE_URL, key)}@chatgpt.local"
 
-def normalize_spaces(s: str) -> str:
-    # håndter NBSP osv.
+def norm(s: str) -> str:
     return " ".join(s.replace("\u00a0", " ").split()).strip()
+
+# Whitelist over kanaler vi accepterer som location
+CHANNEL_PATTERNS = [
+    r"TV2\s*Sport",
+    r"TV2\s*Play",
+    r"TV2\b",
+    r"DR1\b",
+    r"DR2\b",
+    r"TV3\s*Sport",
+]
+
+channel_re = re.compile(r"^(?:" + "|".join(CHANNEL_PATTERNS) + r")$", re.IGNORECASE)
+
+def extract_channel_fallback(text_lines):
+    """
+    Finder første linje der ligner en kanal (fx 'TV2 Sport') og returnerer den.
+    """
+    for ln in text_lines:
+        if channel_re.match(ln):
+            return ln
+    return ""
 
 def main():
     headers = {
@@ -49,7 +69,7 @@ def main():
 
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text("\n")
-    lines = [normalize_spaces(ln) for ln in text.splitlines() if normalize_spaces(ln)]
+    lines = [norm(ln) for ln in text.splitlines() if norm(ln)]
 
     date_re = re.compile(
         r"^(mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(\d{1,2})\.\s+([a-zæøå]+\.)$",
@@ -57,9 +77,7 @@ def main():
     )
     time_re = re.compile(r"^kl\.\s*(\d{1,2}):(\d{2})$", re.IGNORECASE)
 
-    # Variant A: "afspilles på TV2 Sport"
     on_re_inline = re.compile(r"^afspilles på\s+(.+)$", re.IGNORECASE)
-    # Variant B: linjen er kun "afspilles på"
     on_re_bare = re.compile(r"^afspilles på$", re.IGNORECASE)
 
     match_re = re.compile(r".+\s[–-]\s.+")  # "Hold A - Hold B" / "Hold A – Hold B"
@@ -101,11 +119,15 @@ def main():
             summary = ""
             location = ""
             notes_parts = []
+            block_lines = []
 
             j = i + 1
             while j < len(lines):
                 if date_re.match(lines[j]) or time_re.match(lines[j]):
                     break
+
+                # Gem hele blokken til fallback-detektion
+                block_lines.append(lines[j])
 
                 # Kanal (inline)
                 m_inline = on_re_inline.match(lines[j])
@@ -114,7 +136,7 @@ def main():
                     j += 1
                     break
 
-                # Kanal (split over to linjer)
+                # Kanal (split)
                 if on_re_bare.match(lines[j]):
                     if j + 1 < len(lines) and not (date_re.match(lines[j+1]) or time_re.match(lines[j+1])):
                         location = lines[j + 1].strip()
@@ -123,12 +145,17 @@ def main():
                         j += 1
                     break
 
+                # Første kamp-linje bliver SUMMARY, resten bliver noter
                 if (not summary) and match_re.match(lines[j]):
                     summary = lines[j]
                 else:
                     notes_parts.append(lines[j])
 
                 j += 1
+
+            # Fallback: hvis vi ikke fandt location via "afspilles på"
+            if not location:
+                location = extract_channel_fallback(block_lines)
 
             notes = "\n".join([p for p in notes_parts if p]).strip()
 
