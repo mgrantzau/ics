@@ -1,6 +1,9 @@
+# generate_ics.py
+import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+
 import requests
 from bs4 import BeautifulSoup
 
@@ -13,42 +16,48 @@ MONTHS = {
     "jul.": 7, "aug.": 8, "sep.": 9, "okt.": 10, "nov.": 11, "dec.": 12
 }
 
-def parse_date(day: int, month_abbr: str, year_hint: int) -> datetime:
-    return datetime(year_hint, MONTHS[month_abbr], day)
-
 def ics_dt(dt: datetime) -> str:
     return dt.strftime("%Y%m%dT%H%M%S")
 
 def esc(s: str) -> str:
+    # RFC5545 escaping
     return (s.replace("\\", "\\\\")
+             .replace("\r\n", "\n")
+             .replace("\r", "\n")
              .replace("\n", "\\n")
              .replace(",", "\\,")
              .replace(";", "\\;"))
 
 def main():
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; handbold-tv-ics/1.0; +https://github.com/)",
+        "User-Agent": "Mozilla/5.0 (compatible; mgrantzau-ics/1.0; +https://github.com/mgrantzau/ics)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "da,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
 
-    r = requests.get(URL, headers=headers, timeout=30)
+    r = requests.get(URL, headers=headers, timeout=45)
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text("\n")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
+    # Example: "tirsdag 16. dec."
     date_re = re.compile(
         r"^(mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(\d{1,2})\.\s+([a-zæøå]+\.)$",
         re.IGNORECASE
     )
+    # Example: "kl. 18:30"
     time_re = re.compile(r"^kl\.\s*(\d{1,2}):(\d{2})$", re.IGNORECASE)
+    # Example: "afspilles på TV2 Sport"
     on_re = re.compile(r"^afspilles på\s+(.+)$", re.IGNORECASE)
 
     events = []
     current_date = None
 
+    # Year rollover heuristic (dec -> jan)
     now = datetime.now()
     year_hint = now.year
     last_month = None
@@ -64,12 +73,11 @@ def main():
                 i += 1
                 continue
 
-            # Year rollover (dec -> jan)
             if last_month is not None and mon < last_month:
                 year_hint += 1
             last_month = mon
 
-            current_date = parse_date(day, mon_abbr, year_hint)
+            current_date = datetime(year_hint, mon, day)
             i += 1
             continue
 
@@ -77,13 +85,15 @@ def main():
         if current_date and mtime:
             hh = int(mtime.group(1))
             mm = int(mtime.group(2))
+
             start = datetime(current_date.year, current_date.month, current_date.day, hh, mm, 0)
             end = start + timedelta(minutes=DURATION_MIN)
 
-            # Kamp-linjen forventes lige efter tidspunkt
+            # SUMMARY is the next line (holdnavne)
             summary = lines[i + 1] if i + 1 < len(lines) else ""
 
-            # Saml “noter” indtil vi møder “afspilles på …” eller næste dato/tid
+            # NOTES: everything after summary until "afspilles på ..." (exclusive)
+            # LOCATION: the channel after "afspilles på ..."
             notes_parts = []
             location = ""
 
@@ -98,9 +108,11 @@ def main():
                 notes_parts.append(lines[j])
                 j += 1
 
-            notes = "\n".join(notes_parts).strip()
+            notes = "\n".join([p for p in notes_parts if p]).strip()
 
-            events.append((start, end, summary, location, notes))
+            if summary:  # only add if we have a title
+                events.append((start, end, summary, location, notes))
+
             i += 1
             continue
 
@@ -130,7 +142,7 @@ END:VTIMEZONE
 
     out = []
     out.append("BEGIN:VCALENDAR")
-    out.append("PRODID:-//mgrantzau//ics-tv-program//DA")
+    out.append("PRODID:-//ChatGPT//Handball ICS//DA")
     out.append("VERSION:2.0")
     out.append("CALSCALE:GREGORIAN")
     out.append("METHOD:PUBLISH")
@@ -138,7 +150,7 @@ END:VTIMEZONE
 
     for start, end, summary, location, notes in events:
         out.append("BEGIN:VEVENT")
-        out.append(f"UID:{uuid.uuid4()}@mgrantzau-ics")
+        out.append(f"UID:{uuid.uuid4()}@chatgpt.local")
         out.append(f"DTSTAMP:{dtstamp}")
         out.append(f"DTSTART;TZID={TZID}:{ics_dt(start)}")
         out.append(f"DTEND;TZID={TZID}:{ics_dt(end)}")
@@ -152,7 +164,6 @@ END:VTIMEZONE
     out.append("END:VCALENDAR")
     ics = "\r\n".join(out) + "\r\n"
 
-    import os
     os.makedirs("docs", exist_ok=True)
     with open("docs/tv-program.ics", "w", encoding="utf-8", newline="") as f:
         f.write(ics)
