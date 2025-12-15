@@ -1,8 +1,11 @@
 # generate_ics.py
-# Fix v3:
-# - Ingen dubletter: turneringslinjer med "-" bliver ikke behandlet som kamp
-# - LOCATION findes via både tekst og HTML-fallback nær tidspunktet (Playwright-render)
-# - DESCRIPTION = øvrige info
+# Final v4:
+# - Playwright-render (JS-indhold med)
+# - Kun 1 event pr. kamp (ingen turnerings-dubletter / “halve” kampe)
+# - LOCATION = kanal (TV2/DR/TV3 osv.)
+# - DESCRIPTION = øvrige oplysninger
+#
+# Output: docs/tv-program.ics
 
 import os
 import re
@@ -15,7 +18,7 @@ from playwright.sync_api import sync_playwright
 URL = "https://danskhaandbold.dk/tv-program"
 TZID = "Europe/Copenhagen"
 DURATION_MIN = 90
-SCRIPT_VERSION = "2025-12-15-playwright-final-v3"
+SCRIPT_VERSION = "2025-12-15-playwright-final-v4"
 
 MONTHS = {
     "jan.": 1, "feb.": 2, "mar.": 3, "apr.": 4, "maj": 5, "jun.": 6,
@@ -42,6 +45,7 @@ COMPETITION_RE = re.compile(
 # Kampnavne er sjældent fyldt med tal/år eller 1/4 osv.
 BAD_MATCH_TOKENS_RE = re.compile(r"(\b20\d{2}\b|\d+/\d+|\b1/2\b|\b1/4\b|\b1/8\b)", re.IGNORECASE)
 
+# Stop når vi rammer footer-støj
 FOOTER_STOP_RE = re.compile(
     r"(Besøg Landsholdshoppen|CVR nummer|danskhaandbold@danskhaandbold\.dk|DanskHåndbold 2025|GDPR|Boozt\.com)",
     re.IGNORECASE
@@ -72,9 +76,9 @@ def fetch_rendered_html_and_lines() -> tuple[str, list[str]]:
         page.goto(URL, wait_until="networkidle", timeout=60000)
 
         # hjælper ved lazy-load
-        page.mouse.wheel(0, 5000)
+        page.mouse.wheel(0, 6000)
         page.wait_for_timeout(800)
-        page.mouse.wheel(0, 5000)
+        page.mouse.wheel(0, 6000)
         page.wait_for_timeout(800)
 
         html = page.content()
@@ -87,15 +91,22 @@ def fetch_rendered_html_and_lines() -> tuple[str, list[str]]:
 
 def looks_like_real_match_line(line: str) -> bool:
     """
-    Sand hvis linjen ligner "Hold A - Hold B" (eller med –),
-    og ikke ligner turnering/liga (med år, 1/4-finaler osv.).
+    Kun accepter linjer der reelt er "Hold A - Hold B" (én separator),
+    og som ikke ligner turnering/liga.
     """
-    if not re.search(r".+\s[–-]\s.+", line):
+    parts = re.split(r"\s[–-]\s", line)
+    if len(parts) != 2:
         return False
+
+    left, right = parts
+    if len(left.strip()) < 3 or len(right.strip()) < 3:
+        return False
+
     if COMPETITION_RE.search(line):
         return False
     if BAD_MATCH_TOKENS_RE.search(line):
         return False
+
     return True
 
 def extract_channel_from_block(block: list[str]) -> str:
@@ -107,7 +118,7 @@ def extract_channel_from_block(block: list[str]) -> str:
             if m2:
                 return norm(m2.group(1))
 
-    # 2) split: "afspilles", "på", "<kanal>"
+    # 2) split: "afspilles", "på", "<kanal>" eller "afspilles på" + næste linje
     for i, ln in enumerate(block):
         low = ln.lower()
         if low == "afspilles":
@@ -134,13 +145,13 @@ def extract_channel_from_block(block: list[str]) -> str:
 def extract_channel_from_html_near_time(rendered_html: str, hh: int, mm: int) -> str:
     """
     Fallback: find kanal i HTML tæt på tidspunktet HH:MM.
-    Det fanger cases hvor kanal ikke kommer med i soup.get_text().
+    Fanger cases hvor kanal ikke kommer med i soup.get_text().
     """
     anchor = f"{hh:02d}:{mm:02d}"
     pos = rendered_html.find(anchor)
     if pos == -1:
         return ""
-    window = rendered_html[pos:pos + 25000]
+    window = rendered_html[pos:pos + 30000]
     m = CHANNEL_RE.search(window)
     return norm(m.group(1)) if m else ""
 
@@ -172,7 +183,6 @@ def extract_match_summary_and_notes(block: list[str]) -> tuple[str, str]:
     if not summary:
         return "", "\n".join(block).strip()
 
-    # NOTES: alt andet end selve match-navnet (+ fjern "afspilles/på/kanal")
     channel = extract_channel_from_block(block)
     skip_set = {"afspilles", "på", "pa", "afspilles på", "afspilles pa"}
 
@@ -242,9 +252,11 @@ END:VTIMEZONE
 def main():
     html, lines = fetch_rendered_html_and_lines()
 
-    events_map = {}  # (start, summary) -> (end, location, notes)
-    current_date = None
+    # Dedup på tidspunkt: vi vil kun have "bedste" kamp pr. tidspunkt.
+    # "Bedste" = længst SUMMARY (typisk "HoldA - HoldB", ikke "HoldB" alene)
+    best_by_start: dict[datetime, tuple[str, str, str]] = {}  # start -> (summary, location, notes)
 
+    current_date = None
     now = datetime.now()
     year_hint = now.year
     last_month = None
@@ -294,17 +306,32 @@ def main():
                 if not location:
                     location = extract_channel_from_html_near_time(html, hh, mm)
 
-                # Dedup ekstra hårdt: hvis vi allerede har et event på samme tid,
-                # behold den med "Hold A - Hold B" (denne) og overskriv ikke med noget dårligere.
-                events_map[(start, summary)] = (end, location, notes)
+                # Hvis vi allerede har en kamp på samme tidspunkt:
+                # - behold den der er længst (typisk den fulde kamp)
+                # - afvis hvis den nye er en delmængde af den eksisterende
+                existing = best_by_start.get(start)
+                if existing:
+                    existing_summary, _, _ = existing
+                    if summary in existing_summary and summary != existing_summary:
+                        summary = ""  # drop “halv” kamp
+                    elif len(summary) <= len(existing_summary) and existing_summary in summary:
+                        # (sjældent) hvis ny er længere, så skift
+                        pass
+
+                if summary:
+                    if (start not in best_by_start) or (len(summary) > len(best_by_start[start][0])):
+                        best_by_start[start] = (summary, location, notes)
 
             i = j
             continue
 
         i += 1
 
+    # Byg eventliste sorteret
     events = []
-    for (start, summary), (end, location, notes) in sorted(events_map.items(), key=lambda x: (x[0][0], x[0][1])):
+    for start in sorted(best_by_start.keys()):
+        summary, location, notes = best_by_start[start]
+        end = start + timedelta(minutes=DURATION_MIN)
         events.append((start, end, summary, location, notes))
 
     ics = build_ics(events)
