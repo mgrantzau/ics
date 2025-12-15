@@ -54,6 +54,9 @@ def main():
     # Example: "afspilles på TV2 Sport"
     on_re = re.compile(r"^afspilles på\s+(.+)$", re.IGNORECASE)
 
+    # Kamp-linje (tolerant): "Hold A - Hold B" eller "Hold A – Hold B"
+    match_re = re.compile(r".+\s[–-]\s.+")
+
     events = []
     current_date = None
 
@@ -89,31 +92,39 @@ def main():
             start = datetime(current_date.year, current_date.month, current_date.day, hh, mm, 0)
             end = start + timedelta(minutes=DURATION_MIN)
 
-            # SUMMARY is the next line (holdnavne)
-            summary = lines[i + 1] if i + 1 < len(lines) else ""
-
-            # NOTES: everything after summary until "afspilles på ..." (exclusive)
-            # LOCATION: the channel after "afspilles på ..."
-            notes_parts = []
+            summary = ""
             location = ""
+            notes_parts = []
 
-            j = i + 2
+            # Scan frem til næste dato/tid og find:
+            # - første kamp-linje => SUMMARY
+            # - "afspilles på ..." => LOCATION
+            j = i + 1
             while j < len(lines):
                 if date_re.match(lines[j]) or time_re.match(lines[j]):
                     break
+
                 mon_line = on_re.match(lines[j])
                 if mon_line:
                     location = mon_line.group(1).strip()
+                    j += 1
                     break
-                notes_parts.append(lines[j])
+
+                if (not summary) and match_re.match(lines[j]):
+                    summary = lines[j]
+                else:
+                    notes_parts.append(lines[j])
+
                 j += 1
 
             notes = "\n".join([p for p in notes_parts if p]).strip()
 
-            if summary:  # only add if we have a title
+            # Kun opret event hvis vi fandt en kamp-linje
+            if summary:
                 events.append((start, end, summary, location, notes))
 
-            i += 1
+            # Spring forbi hele blokken vi lige har behandlet
+            i = j
             continue
 
         i += 1
