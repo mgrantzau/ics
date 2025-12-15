@@ -16,11 +16,10 @@ MONTHS = {
     "jul.": 7, "aug.": 8, "sep.": 9, "okt.": 10, "nov.": 11, "dec.": 12
 }
 
-def ics_dt(dt: datetime) -> str:
+def ics_dt(dt):
     return dt.strftime("%Y%m%dT%H%M%S")
 
 def esc(s: str) -> str:
-    # RFC5545 escaping
     return (s.replace("\\", "\\\\")
              .replace("\r\n", "\n")
              .replace("\r", "\n")
@@ -28,10 +27,13 @@ def esc(s: str) -> str:
              .replace(",", "\\,")
              .replace(";", "\\;"))
 
-def stable_uid(start: datetime, summary: str) -> str:
-    # Stabil UID pr. event => undgår dubletter ved refresh
+def stable_uid(start, summary: str) -> str:
     key = f"{start.strftime('%Y%m%dT%H%M')};{summary.strip()}"
     return f"{uuid.uuid5(uuid.NAMESPACE_URL, key)}@chatgpt.local"
+
+def normalize_spaces(s: str) -> str:
+    # håndter NBSP osv.
+    return " ".join(s.replace("\u00a0", " ").split()).strip()
 
 def main():
     headers = {
@@ -47,17 +49,20 @@ def main():
 
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text("\n")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    lines = [normalize_spaces(ln) for ln in text.splitlines() if normalize_spaces(ln)]
 
     date_re = re.compile(
         r"^(mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(\d{1,2})\.\s+([a-zæøå]+\.)$",
         re.IGNORECASE
     )
     time_re = re.compile(r"^kl\.\s*(\d{1,2}):(\d{2})$", re.IGNORECASE)
-    on_re = re.compile(r"^afspilles på\s+(.+)$", re.IGNORECASE)
 
-    # Kamp-linje (tolerant): "Hold A - Hold B" eller "Hold A – Hold B"
-    match_re = re.compile(r".+\s[–-]\s.+")
+    # Variant A: "afspilles på TV2 Sport"
+    on_re_inline = re.compile(r"^afspilles på\s+(.+)$", re.IGNORECASE)
+    # Variant B: linjen er kun "afspilles på"
+    on_re_bare = re.compile(r"^afspilles på$", re.IGNORECASE)
+
+    match_re = re.compile(r".+\s[–-]\s.+")  # "Hold A - Hold B" / "Hold A – Hold B"
 
     events = []
     current_date = None
@@ -102,10 +107,20 @@ def main():
                 if date_re.match(lines[j]) or time_re.match(lines[j]):
                     break
 
-                mon_line = on_re.match(lines[j])
-                if mon_line:
-                    location = mon_line.group(1).strip()
+                # Kanal (inline)
+                m_inline = on_re_inline.match(lines[j])
+                if m_inline:
+                    location = m_inline.group(1).strip()
                     j += 1
+                    break
+
+                # Kanal (split over to linjer)
+                if on_re_bare.match(lines[j]):
+                    if j + 1 < len(lines) and not (date_re.match(lines[j+1]) or time_re.match(lines[j+1])):
+                        location = lines[j + 1].strip()
+                        j += 2
+                    else:
+                        j += 1
                     break
 
                 if (not summary) and match_re.match(lines[j]):
