@@ -14,9 +14,6 @@ OUT_FILE = "docs/tv-program.ics"
 TZID = "Europe/Copenhagen"
 DEFAULT_DURATION_MIN = 90
 
-# Filtrér disse kanaler helt væk fra feedet (case-insensitive, normaliseret)
-BLOCKED_CHANNELS = {"tv3 sport", "tv3"}
-
 MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "maj": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "okt": 10, "nov": 11, "dec": 12,
@@ -47,6 +44,16 @@ CHANNEL_PATTERNS = [
 CHANNEL_RE = re.compile(
     r"(?i)\b(?:afspilles\s+på\s+)?(" + "|".join(CHANNEL_PATTERNS) + r")\b"
 )
+
+# Whitelist: kun disse kanaler må komme med i feedet (case-insensitive, normaliseret)
+ALLOWED_CHANNELS = {
+    "tv2 sport",
+    "tv2 sport x",
+    "tv2 play",
+    "dr1",
+    "dr2",
+    "dr tv",
+}
 
 
 @dataclass
@@ -107,7 +114,6 @@ def clean_channel(s: str) -> str:
     s = re.sub(r"\bTV\s*2\b", "TV2", s, flags=re.IGNORECASE)
     s = re.sub(r"\bTV\s*3\b", "TV3", s, flags=re.IGNORECASE)
     s = re.sub(r"\s{2,}", " ", s).strip()
-    # Bevar casing som på sitet er blandet; vi normaliserer kun “TV2/TV3”
     return s
 
 
@@ -121,8 +127,8 @@ def normalize_channel_key(s: str) -> str:
     return s
 
 
-def is_blocked_channel(channel: str) -> bool:
-    return normalize_channel_key(channel) in BLOCKED_CHANNELS
+def is_allowed_channel(channel: str) -> bool:
+    return normalize_channel_key(channel) in ALLOWED_CHANNELS
 
 
 def scrape_cards_payload() -> List[dict]:
@@ -213,7 +219,9 @@ def find_description(lines_after_match: List[str]) -> str:
 def parse_payload_to_events(payload: List[dict]) -> List[Event]:
     year = datetime.now().year
     events: List[Event] = []
-    skipped_tv3_sport = 0
+
+    skipped_not_allowed = 0
+    skipped_missing_channel = 0
 
     for card in payload:
         lines = normalize_lines(card.get("text", ""), card.get("alts", []), card.get("aria", []))
@@ -240,9 +248,14 @@ def parse_payload_to_events(payload: List[dict]) -> List[Event]:
 
                 channel = find_channel(rest)
 
-                # ---- FILTER: drop TV3 Sport ----
-                if is_blocked_channel(channel):
-                    skipped_tv3_sport += 1
+                # ---- WHITELIST FILTER ----
+                if not channel.strip():
+                    skipped_missing_channel += 1
+                    current_time = None
+                    continue
+
+                if not is_allowed_channel(channel):
+                    skipped_not_allowed += 1
                     current_time = None
                     continue
 
@@ -261,8 +274,9 @@ def parse_payload_to_events(payload: List[dict]) -> List[Event]:
     if not events:
         raise RuntimeError("No events were parsed (or all were filtered). The site structure may have changed.")
 
-    # Gem tælling på funktionen (bruges kun til print i __main__)
-    parse_payload_to_events.skipped_tv3_sport = skipped_tv3_sport  # type: ignore[attr-defined]
+    # gem counts til print
+    parse_payload_to_events.skipped_not_allowed = skipped_not_allowed  # type: ignore[attr-defined]
+    parse_payload_to_events.skipped_missing_channel = skipped_missing_channel  # type: ignore[attr-defined]
 
     return events
 
@@ -326,9 +340,12 @@ if __name__ == "__main__":
     events = parse_payload_to_events(payload)
     write_ics(events)
 
-    skipped = getattr(parse_payload_to_events, "skipped_tv3_sport", 0)
+    skipped_not_allowed = getattr(parse_payload_to_events, "skipped_not_allowed", 0)
+    skipped_missing_channel = getattr(parse_payload_to_events, "skipped_missing_channel", 0)
+
     print(f"Generated {len(events)} events → {OUT_FILE}")
-    print(f"Skipped TV3 Sport events: {skipped}")
+    print(f"Skipped (not allowed channel): {skipped_not_allowed}")
+    print(f"Skipped (missing channel): {skipped_missing_channel}")
 
     missing_loc = sum(1 for e in events if not e.location.strip())
     print(f"Missing LOCATION: {missing_loc} / {len(events)}")
