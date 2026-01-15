@@ -22,12 +22,11 @@ MONTHS = {
 DATE_RE = re.compile(r"(\d{1,2})\.\s*([a-zæøå]+)", re.IGNORECASE)
 TIME_RE = re.compile(r"kl\.\s*(\d{1,2}):(\d{2})", re.IGNORECASE)
 
-# Kanal-heuristik: udvid listen hvis der dukker nye op
+# Kanal-heuristik – udvid hvis du ser andre kanalnavne i alt/aria
 CHANNEL_RE = re.compile(
-    r"^(?:TV\s?2|TV2|TV\s?3|TV3|DR\d?|DR\s?TV|Viaplay|TV2\s?Play|TV\s?2\s?Play|"
-    r"TV2\s?Sport\s?X|TV2\s?Sport|TV3\s?Sport|TV3\s?Max|TV2\s?Charlie|TV2\s?News|"
-    r"Eurosport|MAX|Discovery\+)\b",
-    re.IGNORECASE
+    r"(TV\s?2|TV2|TV\s?3|TV3|DR\d?|DR\s?TV|TV2\s?Play|TV\s?2\s?Play|"
+    r"TV2\s?Sport\s?X|TV2\s?Sport|TV3\s?Sport|TV3\s?Max|Viaplay|Eurosport|MAX|Discovery\+)",
+    re.IGNORECASE,
 )
 
 WEEKDAY_WORDS = {"mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "søndag"}
@@ -61,17 +60,14 @@ def parse_time_line(line: str) -> Optional[tuple[int, int]]:
     return int(m.group(1)), int(m.group(2))
 
 
-def looks_like_channel(s: str) -> bool:
-    s = (s or "").strip()
-    if not s:
-        return False
-    return bool(CHANNEL_RE.search(s))
-
-
 def looks_like_weekday_date_header(s: str) -> bool:
-    # fx "torsdag 15. jan." -> indeholder ugedag + datoformat
-    low = s.lower()
-    if not any(w in low.split()[:2] for w in WEEKDAY_WORDS):
+    low = s.lower().strip()
+    if not low:
+        return False
+    words = low.split()
+    if not words:
+        return False
+    if words[0] not in WEEKDAY_WORDS:
         return False
     return bool(DATE_RE.search(low))
 
@@ -86,10 +82,13 @@ def ics_escape(text: str) -> str:
     )
 
 
-def scrape_blocks_text() -> List[str]:
+def scrape_cards_payload() -> List[dict]:
     """
-    Returnerer en liste af tekstblokke (1 blok pr. program-card).
-    Al tekst udtrækkes mens browseren stadig kører (ingen event-loop fejl).
+    Returnerer en liste af dicts pr card:
+      - text: innerText
+      - alts: img alt-tekster
+      - aria: aria-labels
+    Vigtigt: alt udtrækkes mens browseren er åben.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -109,21 +108,79 @@ def scrape_blocks_text() -> List[str]:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(1200)
 
-        blocks: List[str] = page.eval_on_selector_all(
+        payload: List[dict] = page.eval_on_selector_all(
             "main .odd\\:bg-charcoal\\/5",
-            "els => els.map(e => e.innerText)"
+            """
+            (els) => els.map(el => {
+              const text = (el.innerText || "").trim();
+
+              const alts = Array.from(el.querySelectorAll("img"))
+                .map(img => (img.getAttribute("alt") || "").trim())
+                .filter(Boolean);
+
+              const aria = Array.from(el.querySelectorAll("[aria-label]"))
+                .map(n => (n.getAttribute("aria-label") || "").trim())
+                .filter(Boolean);
+
+              // fjern dubletter for ro
+              const uniq = (arr) => Array.from(new Set(arr));
+              return { text, alts: uniq(alts), aria: uniq(aria) };
+            })
+            """,
         )
 
         browser.close()
-        return blocks
+        return payload
 
 
-def parse_blocks_to_events(blocks: List[str]) -> List[Event]:
+def normalize_lines(text: str, alts: List[str], aria: List[str]) -> List[str]:
+    lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
+
+    # Alts og aria kan indeholde kanalnavne – læg dem til som “linjer”
+    for a in (alts or []):
+        if a and a not in lines:
+            lines.append(a)
+    for a in (aria or []):
+        if a and a not in lines:
+            lines.append(a)
+
+    return lines
+
+
+def find_channel(lines_after_match: List[str]) -> str:
+    # Kanal kan ligge hvor som helst i resten af card’et – også i alt/aria
+    for r in lines_after_match:
+        m = CHANNEL_RE.search(r)
+        if m:
+            # brug hele linjen hvis den ser “kanal-ish” ud, ellers match-gruppen
+            return r.strip() if len(r.strip()) <= 40 else m.group(0)
+    return ""
+
+
+def find_description(lines_after_match: List[str]) -> str:
+    # Første “rigtige” linje efter kampen, som ikke er dato/tid/kamp/kanal
+    for r in lines_after_match:
+        rr = r.strip()
+        if not rr:
+            continue
+        if looks_like_weekday_date_header(rr):
+            continue
+        if parse_time_line(rr):
+            continue
+        if " - " in rr:  # næste kamp starter
+            break
+        if CHANNEL_RE.search(rr):
+            continue
+        return rr
+    return ""
+
+
+def parse_payload_to_events(payload: List[dict]) -> List[Event]:
     year = datetime.now().year
     events: List[Event] = []
 
-    for block in blocks:
-        lines = [l.strip() for l in block.split("\n") if l.strip()]
+    for card in payload:
+        lines = normalize_lines(card.get("text", ""), card.get("alts", []), card.get("aria", []))
         if not lines:
             continue
 
@@ -131,7 +188,6 @@ def parse_blocks_to_events(blocks: List[str]) -> List[Event]:
         current_time: Optional[tuple[int, int]] = None
 
         for i, line in enumerate(lines):
-            # opdater date/time når vi ser dem
             d = parse_date_line(line, year)
             if d:
                 current_date = d
@@ -142,38 +198,12 @@ def parse_blocks_to_events(blocks: List[str]) -> List[Event]:
                 current_time = t
                 continue
 
-            # match-linje: kræv " - " og at vi har date+time sat
             if " - " in line and current_date and current_time:
                 summary = line.strip()
-
-                # Kig fremad i resten af blokken for description + channel
                 rest = lines[i + 1 :]
 
-                channel = ""
-                desc = ""
-
-                # Find første kanal-linje
-                for r in rest:
-                    if looks_like_channel(r):
-                        channel = r.strip()
-                        break
-
-                # Find første "beskrivelse" (ikke kanal, ikke datoheader, ikke tid)
-                for r in rest:
-                    rr = r.strip()
-                    if not rr:
-                        continue
-                    if looks_like_channel(rr):
-                        continue
-                    if looks_like_weekday_date_header(rr):
-                        continue
-                    if parse_time_line(rr):
-                        continue
-                    if " - " in rr:  # næste kamp starter
-                        break
-                    # typisk turnering/række
-                    desc = rr
-                    break
+                channel = find_channel(rest)
+                desc = find_description(rest)
 
                 start_dt = datetime(
                     current_date.year, current_date.month, current_date.day,
@@ -191,8 +221,7 @@ def parse_blocks_to_events(blocks: List[str]) -> List[Event]:
                     )
                 )
 
-                # nulstil tid så vi ikke utilsigtet genbruger den
-                current_time = None
+                current_time = None  # undgå genbrug
 
     if not events:
         raise RuntimeError("No events were parsed. The site structure may have changed.")
@@ -209,7 +238,7 @@ def write_ics(events: List[Event]) -> None:
         "VERSION:2.0",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-SCRIPT-VERSION:2026-01-15-dom-parser-final-v3",
+        "X-SCRIPT-VERSION:2026-01-15-dom-parser-final-v4",
         "BEGIN:VTIMEZONE",
         "TZID:Europe/Copenhagen",
         "X-LIC-LOCATION:Europe/Copenhagen",
@@ -231,7 +260,6 @@ def write_ics(events: List[Event]) -> None:
     ]
 
     for e in events:
-        # Stabil UID: starttid + kampnavn (så opdateringer ikke laver dubletter)
         uid_basis = f"{e.start.isoformat()}|{e.summary}"
         uid = uuid.uuid5(uuid.NAMESPACE_URL, uid_basis)
 
@@ -256,7 +284,13 @@ def write_ics(events: List[Event]) -> None:
 
 
 if __name__ == "__main__":
-    blocks = scrape_blocks_text()
-    events = parse_blocks_to_events(blocks)
+    payload = scrape_cards_payload()
+    events = parse_payload_to_events(payload)
     write_ics(events)
     print(f"Generated {len(events)} events → {OUT_FILE}")
+
+    # Valgfri: hurtig sanity check
+    missing_loc = sum(1 for e in events if not e.location.strip())
+    missing_desc = sum(1 for e in events if not e.description.strip())
+    print(f"Missing LOCATION: {missing_loc} / {len(events)}")
+    print(f"Missing DESCRIPTION: {missing_desc} / {len(events)}")
