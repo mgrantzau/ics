@@ -15,7 +15,7 @@ TZID = "Europe/Copenhagen"
 DEFAULT_DURATION_MIN = 90
 
 # Filtrér disse kanaler helt væk fra feedet (case-insensitive, normaliseret)
-BLOCKED_CHANNELS = {"tv3 sport"}
+BLOCKED_CHANNELS = {"tv3 sport", "tv3"}
 
 MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "maj": 5, "jun": 6,
