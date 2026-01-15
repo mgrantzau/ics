@@ -13,9 +13,6 @@ OUT_FILE = "docs/tv-program.ics"
 TZ = "Europe/Copenhagen"
 DEFAULT_DURATION_MIN = 90
 
-# --------------------
-# HELPERS
-# --------------------
 MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "maj": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "okt": 10, "nov": 11, "dec": 12,
@@ -45,32 +42,30 @@ def parse_time_line(line: str) -> Optional[tuple[int, int]]:
 
 def ics_escape(text: str) -> str:
     return (
-        text.replace("\\", "\\\\")
+        (text or "")
+        .replace("\\", "\\\\")
         .replace("\n", "\\n")
         .replace(",", "\\,")
         .replace(";", "\\;")
     )
 
 
-# --------------------
-# SCRAPING
-# --------------------
-def scrape_events() -> List[Dict]:
-    events = []
-    year = datetime.now().year
-    current_date: Optional[date] = None
-
+def scrape_event_blocks_text() -> List[str]:
+    """
+    Returns a list of raw text blocks; each block corresponds to one program card.
+    IMPORTANT: all extraction happens while Playwright is still running.
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
         page.goto(URL, wait_until="networkidle")
 
-        # allow hydration
+        # allow client-side hydration
         page.wait_for_timeout(2500)
 
-        # scroll to load lazy content
-        last_count = 0
-        for _ in range(25):
+        # scroll to trigger lazy-loading
+        last_count = -1
+        for _ in range(30):
             count = page.evaluate(
                 "() => document.querySelectorAll('main .odd\\\\:bg-charcoal\\\\/5').length"
             )
@@ -80,64 +75,89 @@ def scrape_events() -> List[Dict]:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(1200)
 
-        rows = page.query_selector_all("main .odd\\:bg-charcoal\\/5")
+        # Extract *strings* (not element handles) before closing
+        blocks: List[str] = page.eval_on_selector_all(
+            "main .odd\\:bg-charcoal\\/5",
+            "els => els.map(e => e.innerText)"
+        )
+
         browser.close()
+        return blocks
 
-    for row in rows:
-        lines = [l.strip() for l in row.inner_text().split("\n") if l.strip()]
 
-        for line in lines:
+def parse_blocks_to_events(blocks: List[str]) -> List[Dict]:
+    events: List[Dict] = []
+    year = datetime.now().year
+
+    for block in blocks:
+        lines = [l.strip() for l in block.split("\n") if l.strip()]
+
+        current_date: Optional[date] = None
+        current_time: Optional[tuple[int, int]] = None
+
+        # The cards typically contain:
+        #  - weekday + date line (e.g. "torsdag 15. jan.")
+        #  - time line (e.g. "kl. 18:00")
+        #  - match line (e.g. "Spanien - Serbien")
+        #  - tournament line (e.g. "EM ...")
+        #  - channel line (e.g. "TV2 Sport")
+        #
+        # But to be resilient, we scan sequentially.
+        for i, line in enumerate(lines):
             d = parse_date_line(line, year)
             if d:
                 current_date = d
                 continue
 
             t = parse_time_line(line)
-            if t and current_date:
-                hour, minute = t
+            if t:
+                current_time = t
                 continue
 
-            if "-" in line and current_date and t:
+            # Identify match line by presence of " - " (with spaces) to reduce false positives
+            if " - " in line and current_date and current_time:
                 summary = line
+
+                # Next non-empty line = tournament/competition (best effort)
+                description = ""
+                location = ""
+
+                if i + 1 < len(lines):
+                    description = lines[i + 1].strip()
+
+                # Channel often after description
+                if i + 2 < len(lines):
+                    location = lines[i + 2].strip()
+
                 start_dt = datetime(
                     current_date.year,
                     current_date.month,
                     current_date.day,
-                    hour,
-                    minute,
+                    current_time[0],
+                    current_time[1],
                 )
                 end_dt = start_dt + timedelta(minutes=DEFAULT_DURATION_MIN)
-
-                # try to find channel + competition
-                channel = ""
-                description = ""
-
-                idx = lines.index(line)
-                if idx + 1 < len(lines):
-                    description = lines[idx + 1]
-                if idx + 2 < len(lines):
-                    channel = lines[idx + 2]
 
                 events.append(
                     {
                         "summary": summary,
                         "start": start_dt,
                         "end": end_dt,
-                        "location": channel,
+                        "location": location,
                         "description": description,
                     }
                 )
 
+                # reset time so we don't accidentally reuse it if structure is weird
+                current_time = None
+
     if not events:
-        raise RuntimeError("No events parsed – site structure may have changed")
+        raise RuntimeError("No events were parsed. The site structure may have changed.")
 
     return events
 
 
-# --------------------
-# ICS WRITER
-# --------------------
-def write_ics(events: List[Dict]):
+def write_ics(events: List[Dict]) -> None:
     now_utc = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
     lines = [
@@ -146,7 +166,7 @@ def write_ics(events: List[Dict]):
         "VERSION:2.0",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-SCRIPT-VERSION:2026-01-15-dom-parser-final",
+        "X-SCRIPT-VERSION:2026-01-15-dom-parser-final-v2",
         "BEGIN:VTIMEZONE",
         "TZID:Europe/Copenhagen",
         "X-LIC-LOCATION:Europe/Copenhagen",
@@ -168,7 +188,7 @@ def write_ics(events: List[Dict]):
     ]
 
     for e in events:
-        # STABLE UID: start time + summary ONLY
+        # Stable UID: start time + match title only
         uid_basis = f"{e['start'].isoformat()}|{e['summary']}"
         uid = uuid.uuid5(uuid.NAMESPACE_URL, uid_basis)
 
@@ -192,10 +212,8 @@ def write_ics(events: List[Dict]):
         f.write("\n".join(lines))
 
 
-# --------------------
-# MAIN
-# --------------------
 if __name__ == "__main__":
-    events = scrape_events()
+    blocks = scrape_event_blocks_text()
+    events = parse_blocks_to_events(blocks)
     write_ics(events)
     print(f"Generated {len(events)} events → {OUT_FILE}")
