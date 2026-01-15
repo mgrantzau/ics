@@ -22,10 +22,12 @@ MONTHS = {
 DATE_RE = re.compile(r"(\d{1,2})\.\s*([a-zæøå]+)", re.IGNORECASE)
 TIME_RE = re.compile(r"kl\.\s*(\d{1,2}):(\d{2})", re.IGNORECASE)
 
-# Kanal-heuristik – udvid hvis du ser andre kanalnavne i alt/aria
+# Kanal-heuristik (inkl. "afspilles på ...")
 CHANNEL_RE = re.compile(
-    r"(TV\s?2|TV2|TV\s?3|TV3|DR\d?|DR\s?TV|TV2\s?Play|TV\s?2\s?Play|"
-    r"TV2\s?Sport\s?X|TV2\s?Sport|TV3\s?Sport|TV3\s?Max|Viaplay|Eurosport|MAX|Discovery\+)",
+    r"(afspilles\s+på\s+)?("
+    r"TV\s?2|TV2|TV\s?3|TV3|DR\d?|DR\s?TV|TV2\s?Play|TV\s?2\s?Play|"
+    r"TV2\s?Sport\s?X|TV2\s?Sport|TV3\s?Sport|TV3\s?Max|Viaplay|Eurosport|MAX|Discovery\+"
+    r")",
     re.IGNORECASE,
 )
 
@@ -82,13 +84,24 @@ def ics_escape(text: str) -> str:
     )
 
 
+def clean_channel(s: str) -> str:
+    if not s:
+        return ""
+    # Fjern "afspilles på" og trim
+    s = re.sub(r"^\s*afspilles\s+på\s+", "", s, flags=re.IGNORECASE).strip()
+    # Normaliser "TV 2" => "TV2" (valgfrit, men pænere)
+    s = re.sub(r"\bTV\s+2\b", "TV2", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bTV\s+3\b", "TV3", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
 def scrape_cards_payload() -> List[dict]:
     """
     Returnerer en liste af dicts pr card:
       - text: innerText
       - alts: img alt-tekster
       - aria: aria-labels
-    Vigtigt: alt udtrækkes mens browseren er åben.
+    Alt udtrækkes mens browseren er åben.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -122,7 +135,6 @@ def scrape_cards_payload() -> List[dict]:
                 .map(n => (n.getAttribute("aria-label") || "").trim())
                 .filter(Boolean);
 
-              // fjern dubletter for ro
               const uniq = (arr) => Array.from(new Set(arr));
               return { text, alts: uniq(alts), aria: uniq(aria) };
             })
@@ -136,7 +148,7 @@ def scrape_cards_payload() -> List[dict]:
 def normalize_lines(text: str, alts: List[str], aria: List[str]) -> List[str]:
     lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
 
-    # Alts og aria kan indeholde kanalnavne – læg dem til som “linjer”
+    # Alts/aria kan indeholde kanal (eller turnering) – tilføj som “linjer”
     for a in (alts or []):
         if a and a not in lines:
             lines.append(a)
@@ -148,17 +160,22 @@ def normalize_lines(text: str, alts: List[str], aria: List[str]) -> List[str]:
 
 
 def find_channel(lines_after_match: List[str]) -> str:
-    # Kanal kan ligge hvor som helst i resten af card’et – også i alt/aria
     for r in lines_after_match:
         m = CHANNEL_RE.search(r)
         if m:
-            # brug hele linjen hvis den ser “kanal-ish” ud, ellers match-gruppen
-            return r.strip() if len(r.strip()) <= 40 else m.group(0)
+            # Brug den matchede kanal-del (gruppe 2)
+            return clean_channel(m.group(2))
     return ""
 
 
 def find_description(lines_after_match: List[str]) -> str:
-    # Første “rigtige” linje efter kampen, som ikke er dato/tid/kamp/kanal
+    """
+    Første “beskrivelseslinje” efter kampen:
+      - ikke datoheader
+      - ikke tid
+      - ikke næste kamp
+      - ikke kanal
+    """
     for r in lines_after_match:
         rr = r.strip()
         if not rr:
@@ -221,7 +238,8 @@ def parse_payload_to_events(payload: List[dict]) -> List[Event]:
                     )
                 )
 
-                current_time = None  # undgå genbrug
+                # undgå at næste kamp i samme card arver tiden
+                current_time = None
 
     if not events:
         raise RuntimeError("No events were parsed. The site structure may have changed.")
@@ -238,7 +256,7 @@ def write_ics(events: List[Event]) -> None:
         "VERSION:2.0",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-SCRIPT-VERSION:2026-01-15-dom-parser-final-v4",
+        "X-SCRIPT-VERSION:2026-01-15-dom-parser-final-v5",
         "BEGIN:VTIMEZONE",
         "TZID:Europe/Copenhagen",
         "X-LIC-LOCATION:Europe/Copenhagen",
@@ -289,7 +307,6 @@ if __name__ == "__main__":
     write_ics(events)
     print(f"Generated {len(events)} events → {OUT_FILE}")
 
-    # Valgfri: hurtig sanity check
     missing_loc = sum(1 for e in events if not e.location.strip())
     missing_desc = sum(1 for e in events if not e.description.strip())
     print(f"Missing LOCATION: {missing_loc} / {len(events)}")
