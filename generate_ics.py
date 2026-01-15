@@ -22,16 +22,28 @@ MONTHS = {
 DATE_RE = re.compile(r"(\d{1,2})\.\s*([a-zæøå]+)", re.IGNORECASE)
 TIME_RE = re.compile(r"kl\.\s*(\d{1,2}):(\d{2})", re.IGNORECASE)
 
-# Kanal-heuristik (inkl. "afspilles på ...")
-CHANNEL_RE = re.compile(
-    r"(afspilles\s+på\s+)?("
-    r"TV\s?2|TV2|TV\s?3|TV3|DR\d?|DR\s?TV|TV2\s?Play|TV\s?2\s?Play|"
-    r"TV2\s?Sport\s?X|TV2\s?Sport|TV3\s?Sport|TV3\s?Max|Viaplay|Eurosport|MAX|Discovery\+"
-    r")",
-    re.IGNORECASE,
-)
-
 WEEKDAY_WORDS = {"mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "søndag"}
+
+# VIGTIGT: længste/most-specific først, ellers bliver "TV2 Sport" til "TV2"
+CHANNEL_PATTERNS = [
+    r"TV2\s*Sport\s*X",
+    r"TV2\s*Sport",
+    r"TV2\s*Play",
+    r"TV3\s*Sport",
+    r"TV3\s*Max",
+    r"DR\s*TV",
+    r"DR\s*\d",
+    r"Viaplay",
+    r"Eurosport",
+    r"MAX",
+    r"Discovery\+",
+    r"TV3",
+    r"TV2",
+]
+
+CHANNEL_RE = re.compile(
+    r"(?i)\b(?:afspilles\s+på\s+)?(" + "|".join(CHANNEL_PATTERNS) + r")\b"
+)
 
 
 @dataclass
@@ -87,17 +99,18 @@ def ics_escape(text: str) -> str:
 def clean_channel(s: str) -> str:
     if not s:
         return ""
-    # Fjern "afspilles på" og trim
     s = re.sub(r"^\s*afspilles\s+på\s+", "", s, flags=re.IGNORECASE).strip()
-    # Normaliser "TV 2" => "TV2" (valgfrit, men pænere)
-    s = re.sub(r"\bTV\s+2\b", "TV2", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bTV\s+3\b", "TV3", s, flags=re.IGNORECASE)
-    return s.strip()
+    # Normaliser små mellemrumvarianter
+    s = re.sub(r"\bTV\s*2\b", "TV2", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bTV\s*3\b", "TV3", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    # Bevar casing som på sitet er blandet; vi normaliserer kun “TV2/TV3”
+    return s
 
 
 def scrape_cards_payload() -> List[dict]:
     """
-    Returnerer en liste af dicts pr card:
+    Returnerer pr card:
       - text: innerText
       - alts: img alt-tekster
       - aria: aria-labels
@@ -109,7 +122,6 @@ def scrape_cards_payload() -> List[dict]:
         page.goto(URL, wait_until="networkidle")
         page.wait_for_timeout(2500)
 
-        # Scroll for lazy load
         last_count = -1
         for _ in range(30):
             count = page.evaluate(
@@ -147,35 +159,24 @@ def scrape_cards_payload() -> List[dict]:
 
 def normalize_lines(text: str, alts: List[str], aria: List[str]) -> List[str]:
     lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
-
-    # Alts/aria kan indeholde kanal (eller turnering) – tilføj som “linjer”
     for a in (alts or []):
         if a and a not in lines:
             lines.append(a)
     for a in (aria or []):
         if a and a not in lines:
             lines.append(a)
-
     return lines
 
 
 def find_channel(lines_after_match: List[str]) -> str:
     for r in lines_after_match:
-        m = CHANNEL_RE.search(r)
+        m = CHANNEL_RE.search(r.strip())
         if m:
-            # Brug den matchede kanal-del (gruppe 2)
-            return clean_channel(m.group(2))
+            return clean_channel(m.group(1))
     return ""
 
 
 def find_description(lines_after_match: List[str]) -> str:
-    """
-    Første “beskrivelseslinje” efter kampen:
-      - ikke datoheader
-      - ikke tid
-      - ikke næste kamp
-      - ikke kanal
-    """
     for r in lines_after_match:
         rr = r.strip()
         if not rr:
@@ -184,7 +185,7 @@ def find_description(lines_after_match: List[str]) -> str:
             continue
         if parse_time_line(rr):
             continue
-        if " - " in rr:  # næste kamp starter
+        if " - " in rr:  # næste kamp
             break
         if CHANNEL_RE.search(rr):
             continue
@@ -228,17 +229,8 @@ def parse_payload_to_events(payload: List[dict]) -> List[Event]:
                 )
                 end_dt = start_dt + timedelta(minutes=DEFAULT_DURATION_MIN)
 
-                events.append(
-                    Event(
-                        summary=summary,
-                        start=start_dt,
-                        end=end_dt,
-                        location=channel,
-                        description=desc,
-                    )
-                )
+                events.append(Event(summary=summary, start=start_dt, end=end_dt, location=channel, description=desc))
 
-                # undgå at næste kamp i samme card arver tiden
                 current_time = None
 
     if not events:
@@ -256,7 +248,7 @@ def write_ics(events: List[Event]) -> None:
         "VERSION:2.0",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-SCRIPT-VERSION:2026-01-15-dom-parser-final-v5",
+        "X-SCRIPT-VERSION:2026-01-15-dom-parser-final-v6",
         "BEGIN:VTIMEZONE",
         "TZID:Europe/Copenhagen",
         "X-LIC-LOCATION:Europe/Copenhagen",
@@ -308,6 +300,4 @@ if __name__ == "__main__":
     print(f"Generated {len(events)} events → {OUT_FILE}")
 
     missing_loc = sum(1 for e in events if not e.location.strip())
-    missing_desc = sum(1 for e in events if not e.description.strip())
     print(f"Missing LOCATION: {missing_loc} / {len(events)}")
-    print(f"Missing DESCRIPTION: {missing_desc} / {len(events)}")
