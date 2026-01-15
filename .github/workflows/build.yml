@@ -3,8 +3,8 @@ name: Build and publish ICS
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 6,18 * * *"
-  
+    - cron: "15 6,18 * * *" # 06:15 og 18:15 (UTC) = 07:15 og 19:15 i DK om vinteren
+
 permissions:
   contents: write
 
@@ -21,6 +21,7 @@ jobs:
 
       - name: Install deps
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Install Playwright browsers
@@ -30,6 +31,10 @@ jobs:
       - name: Generate ICS
         run: |
           python generate_ics.py
+
+      - name: Sanity check ICS
+        run: |
+          python sanity_check_ics.py
 
       - name: Commit updated ICS
         run: |
