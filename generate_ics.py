@@ -53,6 +53,7 @@ ALLOWED_CHANNELS = {
     "dr1",
     "dr2",
     "dr tv",
+    "tv2"
 }
 
 
