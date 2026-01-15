@@ -14,6 +14,9 @@ OUT_FILE = "docs/tv-program.ics"
 TZID = "Europe/Copenhagen"
 DEFAULT_DURATION_MIN = 90
 
+# Filtrér disse kanaler helt væk fra feedet (case-insensitive, normaliseret)
+BLOCKED_CHANNELS = {"tv3 sport"}
+
 MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "maj": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "okt": 10, "nov": 11, "dec": 12,
@@ -108,6 +111,20 @@ def clean_channel(s: str) -> str:
     return s
 
 
+def normalize_channel_key(s: str) -> str:
+    """
+    Normaliser kanalnavn til en stabil nøgle til sammenligning.
+    """
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s{2,}", " ", s)
+    s = s.replace("tv 2", "tv2").replace("tv 3", "tv3")
+    return s
+
+
+def is_blocked_channel(channel: str) -> bool:
+    return normalize_channel_key(channel) in BLOCKED_CHANNELS
+
+
 def scrape_cards_payload() -> List[dict]:
     """
     Returnerer pr card:
@@ -196,6 +213,7 @@ def find_description(lines_after_match: List[str]) -> str:
 def parse_payload_to_events(payload: List[dict]) -> List[Event]:
     year = datetime.now().year
     events: List[Event] = []
+    skipped_tv3_sport = 0
 
     for card in payload:
         lines = normalize_lines(card.get("text", ""), card.get("alts", []), card.get("aria", []))
@@ -221,6 +239,13 @@ def parse_payload_to_events(payload: List[dict]) -> List[Event]:
                 rest = lines[i + 1 :]
 
                 channel = find_channel(rest)
+
+                # ---- FILTER: drop TV3 Sport ----
+                if is_blocked_channel(channel):
+                    skipped_tv3_sport += 1
+                    current_time = None
+                    continue
+
                 desc = find_description(rest)
 
                 start_dt = datetime(
@@ -234,7 +259,10 @@ def parse_payload_to_events(payload: List[dict]) -> List[Event]:
                 current_time = None
 
     if not events:
-        raise RuntimeError("No events were parsed. The site structure may have changed.")
+        raise RuntimeError("No events were parsed (or all were filtered). The site structure may have changed.")
+
+    # Gem tælling på funktionen (bruges kun til print i __main__)
+    parse_payload_to_events.skipped_tv3_sport = skipped_tv3_sport  # type: ignore[attr-defined]
 
     return events
 
@@ -297,7 +325,10 @@ if __name__ == "__main__":
     payload = scrape_cards_payload()
     events = parse_payload_to_events(payload)
     write_ics(events)
+
+    skipped = getattr(parse_payload_to_events, "skipped_tv3_sport", 0)
     print(f"Generated {len(events)} events → {OUT_FILE}")
+    print(f"Skipped TV3 Sport events: {skipped}")
 
     missing_loc = sum(1 for e in events if not e.location.strip())
     print(f"Missing LOCATION: {missing_loc} / {len(events)}")
