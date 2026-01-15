@@ -318,7 +318,7 @@ def rows_to_events(rows: List[dict]) -> List[TvEvent]:
         description = competition
 
         # Stable UID basis
-        uid_basis = f"{start_dt.isoformat()}|{summary}|{location}|{description}"
+        uid_basis = f"{start_dt.isoformat()}|{summary}"
         uid = make_uid(uid_basis)
 
         events.append(
