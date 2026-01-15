@@ -124,6 +124,7 @@ def normalize_channel_key(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s{2,}", " ", s)
     s = s.replace("tv 2", "tv2").replace("tv 3", "tv3")
+    s = s.replace("dr 1", "dr1").replace("dr 2", "dr2")
     return s
 
 
