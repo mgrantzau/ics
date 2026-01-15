@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 # generate_ics.py
 #
-# Scrapes https://danskhaandbold.dk/tv-program (rendered) and generates docs/tv-program.ics
-# Output rules:
-#   - SUMMARY    = "Hold A - Hold B"  (or best possible fallback)
-#   - LOCATION   = TV-kanal (fx "TV2 Sport", "DR2")
-#   - DESCRIPTION= Turnering/round + evt. ekstra info
+# Robust scraper for https://danskhaandbold.dk/tv-program using Playwright-rendered text.
+# Strategy:
+#   1) Render page in Chromium
+#   2) Read main.innerText (big text blob)
+#   3) Parse line-by-line with a simple state machine:
+#        date heading -> time -> match title -> competition -> channel
 #
-# Robust against the common formatting issue where competition/round ends up as SUMMARY.
+# Output rules:
+#   - SUMMARY    = "Hold A - Hold B"  (match)
+#   - LOCATION   = TV channel (e.g., "TV2 Sport", "DR2")
+#   - DESCRIPTION= competition/round + any extra lines (optional)
+#
+# Duration default: 90 minutes
+#
+# If parsing fails, the script prints diagnostics (first lines) to help adjust.
 
 from __future__ import annotations
 
@@ -17,15 +25,16 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
 URL = "https://danskhaandbold.dk/tv-program"
 OUT_PATH = Path("docs/tv-program.ics")
 TZID = "Europe/Copenhagen"
-SCRIPT_VERSION = "2026-01-15-tv-program-final-title-fix"
+SCRIPT_VERSION = "2026-01-15-tv-program-textparser-v1"
+DEFAULT_DURATION_MIN = 90
 
 
 # -----------------------------
@@ -42,15 +51,10 @@ class MatchEvent:
 
 
 # -----------------------------
-# Helpers: text & ICS
+# ICS helpers
 # -----------------------------
-def _strip(s: str) -> str:
-    return re.sub(r"[ \t]+", " ", (s or "").strip())
-
-
 def ics_escape(text: str) -> str:
-    # RFC5545 escaping for TEXT
-    # Backslash, semicolon, comma, newline
+    text = (text or "")
     text = text.replace("\\", "\\\\")
     text = text.replace(";", r"\;")
     text = text.replace(",", r"\,")
@@ -60,7 +64,6 @@ def ics_escape(text: str) -> str:
 
 
 def ics_fold_line(line: str, limit: int = 75) -> str:
-    # Fold lines at 75 octets; we approximate by characters (OK for ASCII-heavy content).
     if len(line) <= limit:
         return line
     out = []
@@ -76,7 +79,6 @@ def dt_to_ics_local(dt: datetime) -> str:
 
 
 def dt_to_ics_utc(dt: datetime) -> str:
-    # We write DTSTAMP in UTC. We don't convert timezone-aware here; just treat as UTC timestamp.
     return dt.strftime("%Y%m%dT%H%M%SZ")
 
 
@@ -115,361 +117,341 @@ def build_ics(events: List[MatchEvent]) -> str:
     ]
 
     for ev in events:
-        uid = stable_uid(ev.uid_seed)
         lines.extend(
             [
                 "BEGIN:VEVENT",
-                f"UID:{uid}",
+                f"UID:{stable_uid(ev.uid_seed)}",
                 f"DTSTAMP:{dt_to_ics_utc(now_utc)}",
                 f"DTSTART;TZID={TZID}:{dt_to_ics_local(ev.start)}",
                 f"DTEND;TZID={TZID}:{dt_to_ics_local(ev.end)}",
                 f"SUMMARY:{ics_escape(ev.summary)}",
-                f"LOCATION:{ics_escape(ev.location)}" if ev.location else "LOCATION:",
-                f"DESCRIPTION:{ics_escape(ev.description)}" if ev.description else "DESCRIPTION:",
+                f"LOCATION:{ics_escape(ev.location)}",
+                f"DESCRIPTION:{ics_escape(ev.description)}",
                 "END:VEVENT",
             ]
         )
 
     lines.append("END:VCALENDAR")
 
-    # Fold
-    folded = []
-    for ln in lines:
-        folded.append(ics_fold_line(ln))
+    folded = [ics_fold_line(ln) for ln in lines]
     return "\r\n".join(folded) + "\r\n"
 
 
 # -----------------------------
-# Parsing logic
+# Parsing helpers
 # -----------------------------
+WEEKDAYS_DA = (
+    "mandag",
+    "tirsdag",
+    "onsdag",
+    "torsdag",
+    "fredag",
+    "lørdag",
+    "søndag",
+)
+
+MONTHS_DA: Dict[str, int] = {
+    "jan": 1,
+    "januar": 1,
+    "feb": 2,
+    "februar": 2,
+    "mar": 3,
+    "marts": 3,
+    "apr": 4,
+    "april": 4,
+    "maj": 5,
+    "jun": 6,
+    "juni": 6,
+    "jul": 7,
+    "juli": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "september": 9,
+    "okt": 10,
+    "oktober": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+# Date headers often look like: "torsdag 16. jan." or "torsdag 16. januar"
+DATE_HEADER_RE = re.compile(
+    r"^(?P<wd>(" + "|".join(WEEKDAYS_DA) + r"))\s+"
+    r"(?P<day>\d{1,2})\.\s*"
+    r"(?P<mon>[A-Za-zæøåÆØÅ\.]+)\s*$",
+    re.IGNORECASE,
+)
+
+# Times can be "18:00" or "18.00"
+TIME_RE = re.compile(r"^(?P<h>\d{1,2})[:\.](?P<m>\d{2})$")
+
 CHANNEL_RE = re.compile(
     r"\b("
-    r"TV\s?2(?:\s*Sport|\s*News|\s*Charlie|\s*Echo|\s*Zulu)?|"
+    r"TV\s?2(?:\s*Sport|\s*News|\s*Charlie|\s*Echo|\s*Zulu|"
+    r"\s*Play)?|"
     r"TV3(?:\s*Sport)?|"
-    r"DR1|DR2|DR\s?Ramasjang|DR\s?TV|"
-    r"Eurosport(?:\s*\d+)?|"
-    r"Viaplay|"
-    r"Sport Live|"
-    r"MAX|"
-    r"Discovery\+|"
-    r"DAZN"
+    r"DR1|DR2|DR3|DR\s?Ramasjang|"
+    r"Viaplay|Eurosport(?:\s*\d+)?|Sport Live|MAX|DAZN"
     r")\b",
     re.IGNORECASE,
 )
 
-TIME_RE = re.compile(r"\b(\d{1,2})\.(\d{2})\b")  # "18.00"
-DATE_RE = re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b")  # "16/1/2026" or "16-01-2026"
-ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")  # "2026-01-16"
+# Match line often contains " - " (teams/countries)
+MATCH_RE = re.compile(r".+\s-\s.+")
 
 
-def normalize_channel(text: str) -> str:
-    m = CHANNEL_RE.search(text)
+def normalize_channel(s: str) -> str:
+    m = CHANNEL_RE.search(s or "")
     if not m:
         return ""
     ch = m.group(1).strip()
-    # Simple normalization: TV2 -> TV2, TV 2 -> TV2
     ch = re.sub(r"\bTV\s+2\b", "TV2", ch, flags=re.IGNORECASE)
     ch = re.sub(r"\s{2,}", " ", ch)
     return ch
 
 
-def parse_datetime_from_text(blob: str) -> Tuple[Optional[datetime], Optional[str]]:
+def infer_year(month: int) -> int:
     """
-    Tries to find a date+time in Danish-ish formats.
-    Returns (datetime, date_key_str) where date_key_str is YYYY-MM-DD used for UID seeding.
+    The page often shows upcoming dates without year.
+    We infer year relative to "now" (server time).
+    If we're in Nov/Dec and month is Jan/Feb/Mar -> next year.
+    Otherwise current year.
     """
-    blob = blob.replace("\u00a0", " ")
-
-    # Date (prefer ISO-like)
-    ymd = None
-    m = ISO_DATE_RE.search(blob)
-    if m:
-        y, mo, d = map(int, m.groups())
-        ymd = (y, mo, d)
-    else:
-        m = DATE_RE.search(blob)
-        if m:
-            d, mo, y = m.groups()
-            d = int(d)
-            mo = int(mo)
-            y = int(y)
-            if y < 100:
-                y += 2000
-            ymd = (y, mo, d)
-
-    # Time
-    tm = None
-    m = TIME_RE.search(blob)
-    if m:
-        hh, mm = m.groups()
-        tm = (int(hh), int(mm))
-
-    if not ymd or not tm:
-        return None, None
-
-    dt = datetime(ymd[0], ymd[1], ymd[2], tm[0], tm[1])
-    date_key = f"{ymd[0]:04d}-{ymd[1]:02d}-{ymd[2]:02d}"
-    return dt, date_key
+    now = datetime.now()
+    if now.month in (11, 12) and month in (1, 2, 3):
+        return now.year + 1
+    return now.year
 
 
-def extract_teams_and_competition(lines: List[str]) -> Tuple[str, str]:
+def parse_date_header(line: str) -> Optional[Tuple[int, int, int]]:
     """
-    Given text lines from a single program item, decide:
-      - teams string for SUMMARY (preferred)
-      - competition/round for DESCRIPTION
-    Heuristics:
-      - Team line often contains " - " OR is two lines with a "-" line between.
-      - Competition is usually the remaining 'heading' line(s).
+    Returns (year, month, day) if line is a Danish date header.
     """
-    cleaned = [ln for ln in (_strip(x) for x in lines) if ln]
-    if not cleaned:
-        return "", ""
+    line = (line or "").strip().lower()
+    m = DATE_HEADER_RE.match(line)
+    if not m:
+        return None
+    day = int(m.group("day"))
+    mon_raw = m.group("mon").strip().lower().rstrip(".")
+    mon = MONTHS_DA.get(mon_raw)
+    if not mon:
+        return None
+    year = infer_year(mon)
+    return year, mon, day
 
-    # Remove obvious noise fragments
-    noise_prefixes = (
-        "Vises på",
-        "Kanal",
-        "TV",
-        "all-day",
-        "starts",
-        "ends",
+
+def parse_time(line: str) -> Optional[Tuple[int, int]]:
+    line = (line or "").strip()
+    m = TIME_RE.match(line)
+    if not m:
+        return None
+    return int(m.group("h")), int(m.group("m"))
+
+
+def clean_line(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def make_event(
+    y: int,
+    mo: int,
+    d: int,
+    hh: int,
+    mm: int,
+    match_title: str,
+    competition: str,
+    channel: str,
+    extras: List[str],
+) -> MatchEvent:
+    start = datetime(y, mo, d, hh, mm)
+    end = start + timedelta(minutes=DEFAULT_DURATION_MIN)
+
+    summary = clean_line(match_title)
+    location = clean_line(channel)
+    desc_lines = []
+    if competition:
+        desc_lines.append(clean_line(competition))
+    for ex in extras:
+        ex = clean_line(ex)
+        if not ex:
+            continue
+        # Avoid duplicates
+        if ex == summary or ex == location or ex == competition:
+            continue
+        desc_lines.append(ex)
+
+    description = "\n".join(desc_lines)
+
+    date_key = f"{y:04d}-{mo:02d}-{d:02d}"
+    uid_seed = f"{date_key}|{hh:02d}:{mm:02d}|{summary}|{location}"
+
+    return MatchEvent(
+        start=start,
+        end=end,
+        summary=summary,
+        location=location,
+        description=description,
+        uid_seed=uid_seed,
     )
-    cleaned = [ln for ln in cleaned if not any(ln.lower().startswith(p.lower()) for p in noise_prefixes)]
-
-    teams = ""
-    comp = ""
-
-    # 1) One-line teams "A - B"
-    for ln in cleaned:
-        if " - " in ln and len(ln.split(" - ", 1)[0]) >= 2 and len(ln.split(" - ", 1)[1]) >= 2:
-            # Guard against "Taber semifinale 1 - Taber semifinale 2" (still valid teams)
-            teams = ln
-            break
-
-    # 2) Three-line pattern: A, "-", B
-    if not teams:
-        for i in range(len(cleaned) - 2):
-            if cleaned[i + 1] == "-" and cleaned[i] and cleaned[i + 2]:
-                teams = f"{cleaned[i]} - {cleaned[i + 2]}"
-                break
-
-    # 3) If we didn't find teams but we have two adjacent likely team lines, use them
-    if not teams:
-        # pick first two non-channel, non-time lines as fallback
-        candidates = []
-        for ln in cleaned:
-            if CHANNEL_RE.search(ln):
-                continue
-            if TIME_RE.search(ln) and len(ln) <= 5:
-                continue
-            if DATE_RE.search(ln) or ISO_DATE_RE.search(ln):
-                continue
-            candidates.append(ln)
-        if len(candidates) >= 2:
-            teams = f"{candidates[0]} - {candidates[1]}"
-
-    # Competition: choose a line that is NOT teams and not channel/time/date
-    def is_meta(ln: str) -> bool:
-        return bool(CHANNEL_RE.search(ln) or DATE_RE.search(ln) or ISO_DATE_RE.search(ln) or (TIME_RE.search(ln) and len(ln) <= 5))
-
-    comp_candidates = []
-    for ln in cleaned:
-        if is_meta(ln):
-            continue
-        if teams and ln == teams:
-            continue
-        # avoid adding parts already in teams
-        if teams and ln in teams:
-            continue
-        comp_candidates.append(ln)
-
-    # If teams exist, comp is first candidate that doesn't look like a team line
-    if teams:
-        # Prefer something with commas / "runde" / "liga" / "EM" / "VM" etc.
-        prefer_re = re.compile(r"\b(runde|liga|lig|turnering|final|semi|kvart|champions|europe|em|vm)\b", re.IGNORECASE)
-        preferred = [c for c in comp_candidates if prefer_re.search(c)]
-        comp = preferred[0] if preferred else (comp_candidates[0] if comp_candidates else "")
-    else:
-        # No teams: treat first non-meta as summary and rest as description
-        comp = comp_candidates[0] if comp_candidates else ""
-
-    return _strip(teams), _strip(comp)
 
 
-def clean_summary(summary: str, competition: str) -> Tuple[str, str]:
+def parse_events_from_lines(lines: List[str]) -> List[MatchEvent]:
     """
-    Final correction:
-    If SUMMARY looks like a competition and DESCRIPTION looks like teams, swap them.
+    State machine:
+      - current_date set by date header
+      - when we hit a time, we start collecting fields for one match:
+          time -> match -> competition -> channel -> (done)
     """
-    s = _strip(summary)
-    c = _strip(competition)
+    events: List[MatchEvent] = []
 
-    # Competition-like patterns
-    compy = re.compile(r"\b(EM|VM|liga|final|runde|turnering|champions|gruppespil|qual|kval|pokal)\b", re.IGNORECASE)
-    teamy = re.compile(r".+ - .+")
+    current_date: Optional[Tuple[int, int, int]] = None
+    pending_time: Optional[Tuple[int, int]] = None
+    pending_match: Optional[str] = None
+    pending_comp: Optional[str] = None
+    pending_channel: Optional[str] = None
+    pending_extras: List[str] = []
 
-    if compy.search(s) and teamy.match(c):
-        return c, s
+    def flush_if_complete():
+        nonlocal pending_time, pending_match, pending_comp, pending_channel, pending_extras
+        if current_date and pending_time and pending_match:
+            y, mo, d = current_date
+            hh, mm = pending_time
+            comp = pending_comp or ""
+            ch = pending_channel or ""
+            ev = make_event(y, mo, d, hh, mm, pending_match, comp, ch, pending_extras)
+            events.append(ev)
 
-    return s, c
+        pending_time = None
+        pending_match = None
+        pending_comp = None
+        pending_channel = None
+        pending_extras = []
 
+    for raw in lines:
+        line = clean_line(raw)
+        if not line:
+            continue
 
-def default_end_time(start: datetime) -> datetime:
-    # Use 90 minutes default, matches what you have been using.
-    return start + timedelta(minutes=90)
+        # Update date context if this is a date header
+        dh = parse_date_header(line)
+        if dh:
+            # If we were halfway through a match, flush what we have
+            flush_if_complete()
+            current_date = dh
+            continue
+
+        # Time starts a new match item
+        t = parse_time(line)
+        if t:
+            # Flush previous
+            flush_if_complete()
+            pending_time = t
+            continue
+
+        # If we don't have a date and time context, skip
+        if not current_date or not pending_time:
+            continue
+
+        # Channel?
+        ch = normalize_channel(line)
+        if ch:
+            pending_channel = ch
+            # We consider it "complete enough" once channel is seen
+            flush_if_complete()
+            continue
+
+        # Match title?
+        if pending_match is None and MATCH_RE.match(line):
+            pending_match = line
+            continue
+
+        # If match is still None, some items might present teams on two lines with "-" line in between.
+        # Handle: "Portugal" then "-" then "Rumænien"
+        if pending_match is None:
+            # Look for a lone "-" marker as a separator; store it and combine with next line
+            if line == "-":
+                pending_extras.append(line)
+                continue
+
+            # If last extra is "-", combine previous non-meta line with this into match
+            if pending_extras and pending_extras[-1] == "-" and len(pending_extras) >= 2:
+                # pending_extras[-2] is previous line
+                left = pending_extras[-2]
+                right = line
+                # Remove the two extras used
+                pending_extras = pending_extras[:-2]
+                pending_match = f"{left} - {right}"
+                continue
+
+        # Competition/round (first non-match, non-channel line after match)
+        if pending_match is not None and pending_comp is None:
+            # Avoid storing something that is clearly part of the match again
+            if line != pending_match:
+                pending_comp = line
+                continue
+
+        # Everything else becomes extra notes
+        pending_extras.append(line)
+
+    # flush tail
+    flush_if_complete()
+
+    # De-dup by uid_seed
+    uniq: Dict[str, MatchEvent] = {}
+    for ev in events:
+        uniq[ev.uid_seed] = ev
+    out = list(uniq.values())
+    out.sort(key=lambda e: (e.start, e.summary))
+    return out
 
 
 # -----------------------------
-# Scrape with Playwright
+# Playwright: fetch rendered main text
 # -----------------------------
-def scrape_program_text_blocks() -> List[str]:
-    """
-    Returns a list of text blocks, one per TV-program item.
-    We do not rely on brittle CSS class names; instead we scan for repeating card-like elements.
-    """
+def get_main_text() -> str:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(URL, wait_until="domcontentloaded")
 
-        # Try to wait for something meaningful on the page.
+        # Let client-side rendering finish
+        page.wait_for_timeout(3000)
+
+        # Some pages need scrolling to trigger lazy content
         try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(1500)
-        except PlaywrightTimeoutError:
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(500)
+        except Exception:
             pass
 
-        # Some sites load content asynchronously; give it a little more time.
-        page.wait_for_timeout(1500)
-
-        # Extract candidate blocks:
-        # We pick elements with substantial text and containing a channel or time.
-        blocks: List[str] = page.evaluate(
-            """
-            () => {
-              const elements = Array.from(document.querySelectorAll("main, section, article, div, li"));
-              const seen = new Set();
-              const out = [];
-
-              function norm(s){ return (s||"").replace(/\\s+/g," ").trim(); }
-
-              for (const el of elements) {
-                const txt = norm(el.innerText);
-                if (!txt) continue;
-
-                // Heuristic: item must contain time like 18.00 or 20.45 AND some known channel token
-                const hasTime = /\\b\\d{1,2}\\.\\d{2}\\b/.test(txt);
-                const hasChannel = /\\b(TV\\s?2|TV3|DR1|DR2|Viaplay|Eurosport|Sport Live|MAX|DAZN)\\b/i.test(txt);
-
-                // Keep medium blocks (avoid huge footers)
-                if ((hasTime || hasChannel) && txt.length >= 20 && txt.length <= 400) {
-                  // de-dup by exact text
-                  if (!seen.has(txt)) {
-                    seen.add(txt);
-                    out.push(txt);
-                  }
-                }
-              }
-
-              return out;
-            }
-            """
-        )
+        # Prefer main; fallback to body
+        main = ""
+        try:
+            main = page.locator("main").inner_text(timeout=3000)
+        except Exception:
+            main = page.locator("body").inner_text(timeout=3000)
 
         browser.close()
-
-    return [b for b in blocks if b and len(b) < 800]
-
-
-def build_events_from_blocks(blocks: Iterable[str]) -> List[MatchEvent]:
-    events: List[MatchEvent] = []
-    for block in blocks:
-        # Split into lines to do better extraction
-        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
-
-        # Date+time
-        start_dt, date_key = parse_datetime_from_text(block)
-        if not start_dt or not date_key:
-            # If we can't parse date/time, skip
-            continue
-
-        # Channel
-        channel = normalize_channel(block)
-
-        # Teams + competition
-        teams, competition = extract_teams_and_competition(lines)
-
-        # If teams weren't found, fallback to a safer summary
-        summary = teams if teams else (competition if competition else "Håndboldkamp")
-
-        # Now apply swap-fix if needed
-        summary, competition = clean_summary(summary, competition)
-
-        # Description: keep competition + any extra lines that aren't duplicative
-        # If competition is empty but we have leftover, keep something.
-        description = competition
-
-        # Add extra detail lines (excluding duplicates and meta)
-        extra = []
-        for ln in lines:
-            ln = _strip(ln)
-            if not ln:
-                continue
-            if ln == summary or ln == competition:
-                continue
-            if CHANNEL_RE.search(ln):
-                continue
-            if DATE_RE.search(ln) or ISO_DATE_RE.search(ln):
-                continue
-            if TIME_RE.search(ln) and len(ln) <= 5:
-                continue
-            # Avoid adding team fragments already present
-            if summary and ln in summary:
-                continue
-            extra.append(ln)
-
-        # Keep description compact and stable
-        if extra:
-            if description:
-                description = description + "\n" + "\n".join(extra[:4])
-            else:
-                description = "\n".join(extra[:4])
-
-        # End time
-        end_dt = default_end_time(start_dt)
-
-        # UID seed should be stable across runs for same match
-        uid_seed = f"{date_key}|{start_dt.strftime('%H:%M')}|{summary}|{channel}"
-
-        events.append(
-            MatchEvent(
-                start=start_dt,
-                end=end_dt,
-                summary=summary,
-                location=channel,
-                description=description,
-                uid_seed=uid_seed,
-            )
-        )
-
-    # Deduplicate by uid_seed (in case scraping returns same block twice)
-    unique = {}
-    for ev in events:
-        unique[ev.uid_seed] = ev
-    events = list(unique.values())
-
-    # Sort
-    events.sort(key=lambda e: (e.start, e.summary))
-    return events
+        return main
 
 
 def main() -> int:
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    blocks = scrape_program_text_blocks()
-    events = build_events_from_blocks(blocks)
+    text = get_main_text()
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+
+    events = parse_events_from_lines(lines)
 
     if not events:
-        print("ERROR: No events were parsed. The site structure may have changed.", file=sys.stderr)
+        # Print diagnostics so you can see what the CI actually receives
+        diag = "\n".join(lines[:120])
+        print("ERROR: No events were parsed. Dumping first 120 lines of main text:\n", file=sys.stderr)
+        print(diag, file=sys.stderr)
         return 2
 
     ics = build_ics(events)
