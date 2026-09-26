@@ -193,19 +193,6 @@ def parse_time_line(
     )
 
 
-def is_date_line(
-    line: str,
-) -> bool:
-
-    return (
-        parse_date_line(
-            line,
-            datetime.now().year,
-        )
-        is not None
-    )
-
-
 def is_channel_line(
     line: str,
 ) -> bool:
@@ -609,15 +596,10 @@ def extract_date_time_blocks(
 ) -> List[tuple]:
 
     """
-    Opdel DOM-sekvensen efter:
+    Opdel DOM-sekvensen efter dato + tidspunkt.
 
-        dato
-        tidspunkt
-
-    Hver forekomst af dato+tid bliver én rå blok.
-
-    Siden indeholder typisk to responsive repræsentationer
-    af samme kamp. Det håndteres senere ved deduplikering.
+    Håndbold.dk indeholder typisk to responsive
+    repræsentationer af hver kamp.
     """
 
     year = datetime.now().year
@@ -797,9 +779,8 @@ def reconstruct_fragmented_match(
         -
         hold 2
 
-    Denne funktion kan rekonstruere kampen.
-
-    Den bruges primært som fallback.
+    Rekonstruér den til:
+        hold 1 - hold 2
     """
 
     for index, line in enumerate(
@@ -828,10 +809,14 @@ def reconstruct_fragmented_match(
         if not left or not right:
             continue
 
-        if is_channel_line(left):
+        if is_channel_line(
+            left
+        ):
             continue
 
-        if is_channel_line(right):
+        if is_channel_line(
+            right
+        ):
             continue
 
         return (
@@ -846,10 +831,10 @@ def find_complete_match_line(
 ) -> Optional[str]:
 
     """
-    Den foretrukne responsive variant har allerede kampen som
-    én samlet tekstlinje.
+    Find den samlede responsive kamptekst.
 
-    Vi vælger en sådan linje, men undgår turneringsbeskrivelser.
+    Hvis et holdnavn selv indeholder " - ", foretrækkes den
+    længste plausible linje.
     """
 
     candidates = []
@@ -890,15 +875,6 @@ def find_complete_match_line(
 
     if not candidates:
         return None
-
-    # Hvis et holdnavn selv indeholder " - ", er den længste
-    # samlede linje normalt den komplette kamp:
-    #
-    # OTP Bank - PICK Szeged (HUN) - GOG
-    #
-    # frem for:
-    #
-    # OTP Bank - PICK Szeged (HUN)
 
     return max(
         candidates,
@@ -987,7 +963,7 @@ def block_to_candidate(
 
 
 # ============================================================
-# CANDIDATE QUALITY / DEDUPLICATION
+# CANDIDATE NORMALIZATION
 # ============================================================
 
 def normalize_summary(
@@ -1003,7 +979,25 @@ def normalize_summary(
     )
 
 
-def candidate_key(
+def candidate_time_key(
+    candidate: Candidate,
+) -> tuple:
+
+    """
+    Dato + tidspunkt.
+
+    Bruges til at sammenligne de responsive varianter af samme
+    kamp.
+    """
+
+    return (
+        candidate.event_date.isoformat(),
+        candidate.event_time[0],
+        candidate.event_time[1],
+    )
+
+
+def candidate_exact_key(
     candidate: Candidate,
 ) -> tuple:
 
@@ -1021,14 +1015,6 @@ def candidate_quality(
     candidate: Candidate,
 ) -> tuple:
 
-    """
-    Hvis to responsive varianter giver samme kamp, foretrækkes:
-
-    1. kandidat med kanal
-    2. kandidat med beskrivelse
-    3. længste summary som sidste sikkerhedsnet
-    """
-
     return (
         1 if candidate.channel else 0,
         1 if candidate.description else 0,
@@ -1036,15 +1022,145 @@ def candidate_quality(
     )
 
 
-def deduplicate_candidates(
+# ============================================================
+# DEDUPLICATION
+# ============================================================
+
+def collapse_prefix_candidates(
     candidates: List[Candidate],
 ) -> List[Candidate]:
+
+    """
+    Løs problemet med holdnavne, der selv indeholder " - ".
+
+    Eksempel fra Håndbold.dk:
+
+        OTP Bank - PICK Szeged (HUN)
+
+    kan fejlagtigt ligne en hel kamp, mens den anden responsive
+    variant korrekt indeholder:
+
+        OTP Bank - PICK Szeged (HUN) - GOG
+
+    Hvis to kandidater har samme dato og tidspunkt, samme kanal,
+    og den kortere summary er et præfiks af den længere efterfulgt
+    af " - ", betragtes den korte som en fragmenteret variant.
+
+    Den længste kandidat beholdes.
+    """
+
+    grouped = {}
+
+    for candidate in candidates:
+
+        key = candidate_time_key(
+            candidate
+        )
+
+        grouped.setdefault(
+            key,
+            []
+        ).append(
+            candidate
+        )
+
+    result = []
+
+    for _, group in grouped.items():
+
+        keep = [
+            True
+            for _ in group
+        ]
+
+        for i, candidate_a in enumerate(
+            group
+        ):
+
+            summary_a = normalize_summary(
+                candidate_a.summary
+            )
+
+            channel_a = normalize_channel_key(
+                candidate_a.channel
+            )
+
+            for j, candidate_b in enumerate(
+                group
+            ):
+
+                if i == j:
+                    continue
+
+                summary_b = normalize_summary(
+                    candidate_b.summary
+                )
+
+                channel_b = normalize_channel_key(
+                    candidate_b.channel
+                )
+
+                if not summary_a:
+                    continue
+
+                if not summary_b:
+                    continue
+
+                if channel_a != channel_b:
+                    continue
+
+                # A skal være den kortere kandidat.
+                if len(summary_a) >= len(summary_b):
+                    continue
+
+                # Den længere kandidat skal begynde med hele
+                # den korte summary efterfulgt af kampseparator.
+                expected_prefix = (
+                    summary_a
+                    + " - "
+                )
+
+                if summary_b.startswith(
+                    expected_prefix
+                ):
+
+                    print(
+                        "COLLAPSE fragment: "
+                        f"{candidate_a.summary} "
+                        "→ "
+                        f"{candidate_b.summary}"
+                    )
+
+                    keep[i] = False
+
+                    break
+
+        for index, candidate in enumerate(
+            group
+        ):
+
+            if keep[index]:
+                result.append(
+                    candidate
+                )
+
+    return result
+
+
+def deduplicate_exact_candidates(
+    candidates: List[Candidate],
+) -> List[Candidate]:
+
+    """
+    Fjern almindelige responsive dubletter med præcis samme
+    dato, tidspunkt og summary.
+    """
 
     selected = {}
 
     for candidate in candidates:
 
-        key = candidate_key(
+        key = candidate_exact_key(
             candidate
         )
 
@@ -1072,6 +1188,38 @@ def deduplicate_candidates(
 
     return list(
         selected.values()
+    )
+
+
+def deduplicate_candidates(
+    candidates: List[Candidate],
+) -> List[Candidate]:
+
+    """
+    To trin:
+
+    1. Fjern præcise responsive dubletter.
+    2. Fjern fragmenter, hvor et holdnavn selv indeholder " - ".
+    """
+
+    exact = (
+        deduplicate_exact_candidates(
+            candidates
+        )
+    )
+
+    collapsed = (
+        collapse_prefix_candidates(
+            exact
+        )
+    )
+
+    # Et sidste exact-pass er billigt og fungerer som
+    # sikkerhedsnet.
+    return (
+        deduplicate_exact_candidates(
+            collapsed
+        )
     )
 
 
@@ -1323,7 +1471,7 @@ def write_ics(
         "METHOD:PUBLISH",
         (
             "X-SCRIPT-VERSION:"
-            "2026-09-26-structured-blocks-v12"
+            "2026-09-26-structured-blocks-v13"
         ),
 
         "BEGIN:VTIMEZONE",
