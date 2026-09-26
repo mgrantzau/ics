@@ -7,9 +7,9 @@ from typing import Optional, List
 from playwright.sync_api import sync_playwright
 
 
-# --------------------
+# ============================================================
 # CONFIG
-# --------------------
+# ============================================================
 
 URL = "https://danskhaandbold.dk/tv-program"
 OUT_FILE = "docs/tv-program.ics"
@@ -58,9 +58,9 @@ WEEKDAY_WORDS = {
 
 # Alle kendte kanaler/platforme.
 #
-# Det er vigtigt, at vi genkender OGSÅ kanaler, som ikke skal
-# med i kalenderen. Ellers risikerer parseren at fortsætte til
-# en senere TV2-kanal og knytte den til den forkerte kamp.
+# Vi skal også kunne identificere kanaler, som IKKE er tilladt.
+# Ellers risikerer vi at knytte en senere TV2-kanal til en
+# tidligere kamp.
 
 CHANNEL_PATTERNS = [
     r"Ekstra\s*Bladet\+",
@@ -90,7 +90,7 @@ CHANNEL_RE = re.compile(
 )
 
 
-# Kun disse kanaler/platforme kommer med i kalenderen.
+# Kun disse kommer med i kalenderen.
 
 ALLOWED_CHANNELS = {
     "tv2",
@@ -103,6 +103,10 @@ ALLOWED_CHANNELS = {
 }
 
 
+# ============================================================
+# DATA
+# ============================================================
+
 @dataclass
 class Event:
     summary: str
@@ -112,55 +116,63 @@ class Event:
     description: str
 
 
+# ============================================================
+# BASIC PARSING
+# ============================================================
+
 def parse_date_line(
     line: str,
     assumed_year: int,
 ) -> Optional[date]:
 
-    m = DATE_RE.search(
+    match = DATE_RE.search(
         line.lower()
     )
 
-    if not m:
+    if not match:
         return None
 
     day = int(
-        m.group(1)
+        match.group(1)
     )
 
-    mon_key = (
-        m.group(2)[:3]
+    month_key = (
+        match.group(2)[:3]
         .lower()
     )
 
     month = MONTHS.get(
-        mon_key
+        month_key
     )
 
     if not month:
         return None
 
-    return date(
-        assumed_year,
-        month,
-        day,
-    )
+    try:
+        return date(
+            assumed_year,
+            month,
+            day,
+        )
+
+    except ValueError:
+        return None
 
 
 def parse_time_line(
     line: str,
 ) -> Optional[tuple[int, int]]:
 
-    m = TIME_RE.search(
+    match = TIME_RE.search(
         line.lower()
     )
 
-    if not m:
+    if not match:
         return None
 
     return (
-        int(m.group(1)),
-        int(m.group(2)),
+        int(match.group(1)),
+        int(match.group(2)),
     )
 
 
@@ -168,15 +180,14 @@ def looks_like_weekday_date_header(
     text: str,
 ) -> bool:
 
-    low = (
-        text.lower()
-        .strip()
-    )
+    text = (
+        text or ""
+    ).strip().lower()
 
-    if not low:
+    if not text:
         return False
 
-    words = low.split()
+    words = text.split()
 
     if not words:
         return False
@@ -185,7 +196,7 @@ def looks_like_weekday_date_header(
         return False
 
     return bool(
-        DATE_RE.search(low)
+        DATE_RE.search(text)
     )
 
 
@@ -211,18 +222,9 @@ def looks_like_match(
     return True
 
 
-def ics_escape(
-    text: str,
-) -> str:
-
-    return (
-        (text or "")
-        .replace("\\", "\\\\")
-        .replace("\n", "\\n")
-        .replace(",", "\\,")
-        .replace(";", "\\;")
-    )
-
+# ============================================================
+# CHANNELS
+# ============================================================
 
 def clean_channel(
     text: str,
@@ -303,32 +305,65 @@ def is_allowed_channel(
 ) -> bool:
 
     return (
-        normalize_channel_key(
-            channel
-        )
+        normalize_channel_key(channel)
         in ALLOWED_CHANNELS
     )
 
 
-# --------------------
+# ============================================================
+# ICS
+# ============================================================
+
+def ics_escape(
+    text: str,
+) -> str:
+
+    return (
+        (text or "")
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+    )
+
+
+# ============================================================
 # SCRAPER
-# --------------------
+# ============================================================
 
-def scrape_cards_payload() -> List[dict]:
+def scrape_ordered_payload() -> List[str]:
 
     """
-    Hent hele den synlige TV-programside.
+    Hent TV-programmet som en sekventiel liste.
 
-    Håndbold.dk har ikke længere den tidligere <main>-struktur,
-    så BODY bruges som datakilde.
+    Vigtigt:
 
-    Selve afgrænsningen mellem kampene sker efterfølgende i
-    parseren og ikke via hjemmesidens styling-klasser.
+    innerText alene indeholder ikke nødvendigvis kanalnavnet,
+    fordi kanalnavnet kan ligge i IMG alt-attributten.
+
+    Derfor gennemgår JavaScript DOM'en i dokumentrækkefølge.
+
+    Tekstnoder bliver lagt ind som almindelige linjer.
+
+    IMG-elementer med alt-tekst bliver lagt ind på PRÆCIS den
+    position i rækkefølgen, hvor billedet forekommer.
+
+    Det betyder, at:
+
+        dato
+        tidspunkt
+        kamp
+        beskrivelse
+        afspilles på TV2 Sport
+
+    bevarer den faktiske rækkefølge fra hjemmesiden.
     """
 
-    with sync_playwright() as p:
+    with sync_playwright() as playwright:
 
-        browser = p.chromium.launch()
+        browser = (
+            playwright.chromium.launch()
+        )
 
         page = browser.new_page(
             viewport={
@@ -373,8 +408,9 @@ def scrape_cards_payload() -> List[dict]:
             5000
         )
 
-        # Scroll siden for at sikre, at lazy-loaded indhold
-        # bliver hentet.
+        # ----------------------------------------------------
+        # LAZY LOADING
+        # ----------------------------------------------------
 
         previous_height = 0
 
@@ -382,7 +418,7 @@ def scrape_cards_payload() -> List[dict]:
 
             height = page.evaluate(
                 """
-                document.body
+                () => document.body
                     ? document.body.scrollHeight
                     : 0
                 """
@@ -393,7 +429,7 @@ def scrape_cards_payload() -> List[dict]:
 
             page.evaluate(
                 """
-                window.scrollTo(
+                () => window.scrollTo(
                     0,
                     document.body.scrollHeight
                 )
@@ -436,78 +472,203 @@ def scrape_cards_payload() -> List[dict]:
                 "did not contain a BODY element."
             )
 
-        body_text = (
-            page.locator("body")
-            .inner_text(
-                timeout=10000
+        # ----------------------------------------------------
+        # ORDERED DOM EXTRACTION
+        # ----------------------------------------------------
+
+        ordered_lines: List[str] = (
+            page.evaluate(
+                """
+                () => {
+                    const root = document.body;
+
+                    if (!root) {
+                        return [];
+                    }
+
+                    const result = [];
+
+                    const pushText = (value) => {
+                        if (!value) {
+                            return;
+                        }
+
+                        const parts = value
+                            .split(/\\n+/)
+                            .map(v => v.trim())
+                            .filter(Boolean);
+
+                        for (const part of parts) {
+                            result.push(part);
+                        }
+                    };
+
+                    const walker =
+                        document.createTreeWalker(
+                            root,
+                            NodeFilter.SHOW_ELEMENT |
+                            NodeFilter.SHOW_TEXT
+                        );
+
+                    let node;
+
+                    while (
+                        (node = walker.nextNode())
+                    ) {
+
+                        if (
+                            node.nodeType ===
+                            Node.TEXT_NODE
+                        ) {
+
+                            const parent =
+                                node.parentElement;
+
+                            if (!parent) {
+                                continue;
+                            }
+
+                            const tag =
+                                parent.tagName;
+
+                            if (
+                                tag === "SCRIPT" ||
+                                tag === "STYLE" ||
+                                tag === "NOSCRIPT"
+                            ) {
+                                continue;
+                            }
+
+                            const style =
+                                window.getComputedStyle(
+                                    parent
+                                );
+
+                            if (
+                                style.display === "none" ||
+                                style.visibility === "hidden"
+                            ) {
+                                continue;
+                            }
+
+                            pushText(
+                                node.textContent
+                            );
+
+                            continue;
+                        }
+
+                        if (
+                            node.nodeType ===
+                            Node.ELEMENT_NODE
+                        ) {
+
+                            const el = node;
+
+                            if (
+                                el.tagName === "IMG"
+                            ) {
+
+                                const alt =
+                                    (
+                                        el.getAttribute(
+                                            "alt"
+                                        ) || ""
+                                    ).trim();
+
+                                if (alt) {
+                                    result.push(
+                                        alt
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    return result;
+                }
+                """
             )
         )
-
-        print(
-            f"Body text length: "
-            f"{len(body_text)}"
-        )
-
-        payload = [
-            {
-                "text": body_text,
-                "alts": [],
-                "aria": [],
-            }
-        ]
 
         browser.close()
 
-        return payload
+        # Fjern tomme linjer og direkte dubletter.
+        cleaned: List[str] = []
 
+        for line in ordered_lines:
 
-# --------------------
-# NORMALISERING
-# --------------------
+            line = (
+                line or ""
+            ).strip()
 
-def normalize_lines(
-    text: str,
-    alts: List[str],
-    aria: List[str],
-) -> List[str]:
+            if not line:
+                continue
 
-    lines = [
-        line.strip()
-        for line
-        in (text or "").split("\n")
-        if line.strip()
-    ]
+            if (
+                cleaned
+                and cleaned[-1] == line
+            ):
+                continue
 
-    for alt in (
-        alts or []
-    ):
-
-        if (
-            alt
-            and alt not in lines
-        ):
-            lines.append(
-                alt
+            cleaned.append(
+                line
             )
 
-    for label in (
-        aria or []
-    ):
+        print(
+            f"Ordered DOM lines: "
+            f"{len(cleaned)}"
+        )
 
-        if (
-            label
-            and label not in lines
-        ):
-            lines.append(
-                label
+        if not cleaned:
+
+            raise RuntimeError(
+                "No ordered DOM content "
+                "could be extracted."
             )
 
-    return lines
+        # Begrænset diagnostik.
+        #
+        # Vi udskriver relevante linjer omkring TV-programmet
+        # uden at dumpe hele siden.
+
+        print(
+            "----- RELEVANT DOM PREVIEW -----"
+        )
+
+        preview_started = False
+        preview_count = 0
+
+        for line in cleaned:
+
+            if (
+                "TV" in line
+                or "kl." in line.lower()
+                or looks_like_match(line)
+                or looks_like_weekday_date_header(line)
+                or "afspilles" in line.lower()
+            ):
+                preview_started = True
+
+            if preview_started:
+
+                print(line)
+
+                preview_count += 1
+
+                if preview_count >= 80:
+                    break
+
+        print(
+            "----- END DOM PREVIEW -----"
+        )
+
+        return cleaned
 
 
-# --------------------
-# KAMP-AFGRÆNSNING
-# --------------------
+# ============================================================
+# MATCH BLOCK
+# ============================================================
 
 def collect_match_block(
     lines: List[str],
@@ -515,15 +676,14 @@ def collect_match_block(
 ) -> List[str]:
 
     """
-    Returnerer kun linjerne, der tilhører den aktuelle kamp.
+    Saml kun data, der tilhører den aktuelle kamp.
 
-    Vi stopper ved:
-      - næste tidspunkt
-      - næste dato
-      - næste kamp
+    Stop ved næste:
+      - dato
+      - tidspunkt
+      - kamp
 
-    Dermed kan en kanal fra en senere kamp aldrig blive brugt
-    på den aktuelle kamp.
+    Derfor kan en kanal fra en senere kamp ikke blive brugt.
     """
 
     block: List[str] = []
@@ -532,30 +692,30 @@ def collect_match_block(
         match_index + 1:
     ]:
 
-        stripped = (
+        line = (
             line or ""
         ).strip()
 
-        if not stripped:
+        if not line:
             continue
 
         if looks_like_weekday_date_header(
-            stripped
+            line
         ):
             break
 
         if parse_time_line(
-            stripped
+            line
         ):
             break
 
         if looks_like_match(
-            stripped
+            line
         ):
             break
 
         block.append(
-            stripped
+            line
         )
 
     return block
@@ -586,156 +746,164 @@ def find_description_in_block(
 
     for line in block:
 
-        stripped = (
+        line = (
             line or ""
         ).strip()
 
-        if not stripped:
+        if not line:
             continue
 
         if CHANNEL_RE.search(
-            stripped
+            line
         ):
             continue
 
         if (
-            stripped.lower()
+            line.lower()
             .startswith(
                 "afspilles på"
             )
         ):
             continue
 
-        return stripped
+        # Logo-alt kan indeholde andre irrelevante
+        # beskrivelser. Undgå de mest oplagte.
+        if (
+            line.lower()
+            .startswith("logo")
+        ):
+            continue
+
+        return line
 
     return ""
 
 
-# --------------------
+# ============================================================
 # PARSER
-# --------------------
+# ============================================================
 
-def parse_payload_to_events(
-    payload: List[dict],
+def parse_lines_to_events(
+    lines: List[str],
 ) -> List[Event]:
 
     year = datetime.now().year
 
     events: List[Event] = []
 
+    current_date: Optional[
+        date
+    ] = None
+
+    current_time: Optional[
+        tuple[int, int]
+    ] = None
+
+    total_matches_found = 0
     skipped_not_allowed = 0
     skipped_missing_channel = 0
-    total_matches_found = 0
 
     skipped_channel_counts = {}
 
-    for card in payload:
+    for index, line in enumerate(
+        lines
+    ):
 
-        lines = normalize_lines(
-            card.get(
-                "text",
-                "",
-            ),
-            card.get(
-                "alts",
-                [],
-            ),
-            card.get(
-                "aria",
-                [],
-            ),
+        parsed_date = (
+            parse_date_line(
+                line,
+                year,
+            )
         )
 
-        if not lines:
-            continue
-
-        current_date: Optional[
-            date
-        ] = None
-
-        current_time: Optional[
-            tuple[int, int]
-        ] = None
-
-        for index, line in enumerate(
-            lines
+        if (
+            parsed_date
+            and looks_like_weekday_date_header(
+                line
+            )
         ):
 
-            parsed_date = (
-                parse_date_line(
-                    line,
-                    year,
-                )
+            current_date = (
+                parsed_date
             )
 
-            if parsed_date:
+            continue
 
-                current_date = (
-                    parsed_date
-                )
-
-                continue
-
-            parsed_time = (
-                parse_time_line(
-                    line
-                )
-            )
-
-            if parsed_time:
-
-                current_time = (
-                    parsed_time
-                )
-
-                continue
-
-            if not looks_like_match(
+        parsed_time = (
+            parse_time_line(
                 line
-            ):
-                continue
+            )
+        )
 
-            if not current_date:
-                continue
+        if parsed_time:
 
-            if not current_time:
-                continue
-
-            total_matches_found += 1
-
-            summary = (
-                line.strip()
+            current_time = (
+                parsed_time
             )
 
-            block = collect_match_block(
-                lines,
-                index,
+            continue
+
+        if not looks_like_match(
+            line
+        ):
+            continue
+
+        if not current_date:
+            continue
+
+        if not current_time:
+            continue
+
+        total_matches_found += 1
+
+        summary = (
+            line.strip()
+        )
+
+        block = collect_match_block(
+            lines,
+            index,
+        )
+
+        channel = (
+            find_channel_in_block(
+                block
+            )
+        )
+
+        description = (
+            find_description_in_block(
+                block
+            )
+        )
+
+        if not channel:
+
+            skipped_missing_channel += 1
+
+            print(
+                "SKIP missing channel: "
+                f"{summary}"
             )
 
-            channel = (
-                find_channel_in_block(
-                    block
-                )
-            )
-
-            description = (
-                find_description_in_block(
-                    block
-                )
-            )
-
-            if not channel:
-
-                skipped_missing_channel += 1
+            if block:
 
                 print(
-                    "SKIP missing channel: "
-                    f"{summary}"
+                    "  Block: "
+                    + " | ".join(
+                        block[:10]
+                    )
                 )
 
-                current_time = None
+            current_time = None
 
-                continue
+            continue
+
+        if not is_allowed_channel(
+            channel
+        ):
+
+            skipped_not_allowed += 1
 
             channel_key = (
                 normalize_channel_key(
@@ -743,61 +911,65 @@ def parse_payload_to_events(
                 )
             )
 
-            if not is_allowed_channel(
-                channel
-            ):
-
-                skipped_not_allowed += 1
-
-                skipped_channel_counts[
-                    channel_key
-                ] = (
-                    skipped_channel_counts
-                    .get(
-                        channel_key,
-                        0,
-                    )
-                    + 1
+            skipped_channel_counts[
+                channel_key
+            ] = (
+                skipped_channel_counts
+                .get(
+                    channel_key,
+                    0,
                 )
-
-                print(
-                    "SKIP channel "
-                    f"{channel}: "
-                    f"{summary}"
-                )
-
-                current_time = None
-
-                continue
-
-            start_dt = datetime(
-                current_date.year,
-                current_date.month,
-                current_date.day,
-                current_time[0],
-                current_time[1],
+                + 1
             )
 
-            end_dt = (
-                start_dt
-                + timedelta(
-                    minutes=(
-                        DEFAULT_DURATION_MIN
-                    )
-                )
-            )
-
-            events.append(
-                Event(
-                    summary=summary,
-                    start=start_dt,
-                    end=end_dt,
-                    location=channel,
-                    description=description,
-                )
+            print(
+                "SKIP channel "
+                f"{channel}: "
+                f"{summary}"
             )
 
             current_time = None
+
+            continue
+
+        start_dt = datetime(
+            current_date.year,
+            current_date.month,
+            current_date.day,
+            current_time[0],
+            current_time[1],
+        )
+
+        end_dt = (
+            start_dt
+            + timedelta(
+                minutes=(
+                    DEFAULT_DURATION_MIN
+                )
+            )
+        )
+
+        events.append(
+            Event(
+                summary=summary,
+                start=start_dt,
+                end=end_dt,
+                location=channel,
+                description=description,
+            )
+        )
+
+        print(
+            "ADD "
+            f"{summary} "
+            f"[{channel}]"
+        )
+
+        current_time = None
+
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
 
     print(
         f"Total matches found: "
@@ -842,28 +1014,27 @@ def parse_payload_to_events(
 
         raise RuntimeError(
             "No allowed events were parsed. "
-            "The site structure or channel "
-            "representation may have changed."
+            "See the DOM diagnostics above."
         )
 
-    parse_payload_to_events.skipped_not_allowed = (
+    parse_lines_to_events.total_matches_found = (
+        total_matches_found
+    )
+
+    parse_lines_to_events.skipped_not_allowed = (
         skipped_not_allowed
     )
 
-    parse_payload_to_events.skipped_missing_channel = (
+    parse_lines_to_events.skipped_missing_channel = (
         skipped_missing_channel
-    )
-
-    parse_payload_to_events.total_matches_found = (
-        total_matches_found
     )
 
     return events
 
 
-# --------------------
-# ICS
-# --------------------
+# ============================================================
+# ICS WRITER
+# ============================================================
 
 def write_ics(
     events: List[Event],
@@ -884,7 +1055,7 @@ def write_ics(
         "METHOD:PUBLISH",
         (
             "X-SCRIPT-VERSION:"
-            "2026-09-26-match-boundaries-v9"
+            "2026-09-26-ordered-dom-v10"
         ),
 
         "BEGIN:VTIMEZONE",
@@ -939,8 +1110,7 @@ def write_ics(
 
                 (
                     f"UID:{uid}"
-                    "@danskhaandbold."
-                    "tvprogram"
+                    "@danskhaandbold.tvprogram"
                 ),
 
                 (
@@ -949,14 +1119,12 @@ def write_ics(
                 ),
 
                 (
-                    f"DTSTART;TZID="
-                    f"{TZID}:"
+                    f"DTSTART;TZID={TZID}:"
                     f"{event.start.strftime('%Y%m%dT%H%M%S')}"
                 ),
 
                 (
-                    f"DTEND;TZID="
-                    f"{TZID}:"
+                    f"DTEND;TZID={TZID}:"
                     f"{event.end.strftime('%Y%m%dT%H%M%S')}"
                 ),
 
@@ -996,19 +1164,19 @@ def write_ics(
         )
 
 
-# --------------------
+# ============================================================
 # MAIN
-# --------------------
+# ============================================================
 
 if __name__ == "__main__":
 
-    payload = (
-        scrape_cards_payload()
+    ordered_lines = (
+        scrape_ordered_payload()
     )
 
     events = (
-        parse_payload_to_events(
-            payload
+        parse_lines_to_events(
+            ordered_lines
         )
     )
 
@@ -1016,22 +1184,26 @@ if __name__ == "__main__":
         events
     )
 
+    total_matches_found = getattr(
+        parse_lines_to_events,
+        "total_matches_found",
+        0,
+    )
+
     skipped_not_allowed = getattr(
-        parse_payload_to_events,
+        parse_lines_to_events,
         "skipped_not_allowed",
         0,
     )
 
     skipped_missing_channel = getattr(
-        parse_payload_to_events,
+        parse_lines_to_events,
         "skipped_missing_channel",
         0,
     )
 
-    total_matches_found = getattr(
-        parse_payload_to_events,
-        "total_matches_found",
-        0,
+    print(
+        "================================"
     )
 
     print(
@@ -1066,4 +1238,8 @@ if __name__ == "__main__":
         f"Missing LOCATION: "
         f"{missing_location} / "
         f"{len(events)}"
+    )
+
+    print(
+        "================================"
     )
