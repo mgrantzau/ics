@@ -6,13 +6,16 @@ from typing import Optional, List
 
 from playwright.sync_api import sync_playwright
 
+
 # --------------------
 # CONFIG
 # --------------------
+
 URL = "https://danskhaandbold.dk/tv-program"
 OUT_FILE = "docs/tv-program.ics"
 TZID = "Europe/Copenhagen"
 DEFAULT_DURATION_MIN = 90
+
 
 MONTHS = {
     "jan": 1,
@@ -29,15 +32,18 @@ MONTHS = {
     "dec": 12,
 }
 
+
 DATE_RE = re.compile(
     r"(\d{1,2})\.\s*([a-zæøå]+)",
     re.IGNORECASE,
 )
 
+
 TIME_RE = re.compile(
     r"kl\.\s*(\d{1,2}):(\d{2})",
     re.IGNORECASE,
 )
+
 
 WEEKDAY_WORDS = {
     "mandag",
@@ -49,23 +55,33 @@ WEEKDAY_WORDS = {
     "søndag",
 }
 
-# VIGTIGT:
-# Længste/most-specific først, ellers bliver "TV2 Sport" til "TV2".
+
+# Alle kendte kanaler/platforme.
+#
+# Det er vigtigt, at vi genkender OGSÅ kanaler, som ikke skal
+# med i kalenderen. Ellers risikerer parseren at fortsætte til
+# en senere TV2-kanal og knytte den til den forkerte kamp.
+
 CHANNEL_PATTERNS = [
+    r"Ekstra\s*Bladet\+",
     r"TV2\s*Sport\s*X",
     r"TV2\s*Sport",
     r"TV2\s*Play",
     r"TV3\s*Sport",
     r"TV3\s*Max",
+    r"TV3\+",
+    r"Sport\s*Live",
+    r"Pluto\s*TV",
     r"DR\s*TV",
     r"DR\s*\d",
     r"Viaplay",
     r"Eurosport",
-    r"MAX",
     r"Discovery\+",
+    r"MAX",
     r"TV3",
     r"TV2",
 ]
+
 
 CHANNEL_RE = re.compile(
     r"(?i)\b(?:afspilles\s+på\s+)?("
@@ -73,16 +89,17 @@ CHANNEL_RE = re.compile(
     + r")\b"
 )
 
-# Whitelist:
-# Kun disse kanaler må komme med i feedet.
+
+# Kun disse kanaler/platforme kommer med i kalenderen.
+
 ALLOWED_CHANNELS = {
+    "tv2",
     "tv2 sport",
     "tv2 sport x",
     "tv2 play",
     "dr1",
     "dr2",
     "dr tv",
-    "tv2",
 }
 
 
@@ -100,15 +117,25 @@ def parse_date_line(
     assumed_year: int,
 ) -> Optional[date]:
 
-    m = DATE_RE.search(line.lower())
+    m = DATE_RE.search(
+        line.lower()
+    )
 
     if not m:
         return None
 
-    day = int(m.group(1))
-    mon_key = m.group(2)[:3].lower()
+    day = int(
+        m.group(1)
+    )
 
-    month = MONTHS.get(mon_key)
+    mon_key = (
+        m.group(2)[:3]
+        .lower()
+    )
+
+    month = MONTHS.get(
+        mon_key
+    )
 
     if not month:
         return None
@@ -124,7 +151,9 @@ def parse_time_line(
     line: str,
 ) -> Optional[tuple[int, int]]:
 
-    m = TIME_RE.search(line.lower())
+    m = TIME_RE.search(
+        line.lower()
+    )
 
     if not m:
         return None
@@ -136,10 +165,13 @@ def parse_time_line(
 
 
 def looks_like_weekday_date_header(
-    s: str,
+    text: str,
 ) -> bool:
 
-    low = s.lower().strip()
+    low = (
+        text.lower()
+        .strip()
+    )
 
     if not low:
         return False
@@ -157,6 +189,28 @@ def looks_like_weekday_date_header(
     )
 
 
+def looks_like_match(
+    text: str,
+) -> bool:
+
+    text = (
+        text or ""
+    ).strip()
+
+    if not text:
+        return False
+
+    if " - " not in text:
+        return False
+
+    if looks_like_weekday_date_header(
+        text
+    ):
+        return False
+
+    return True
+
+
 def ics_escape(
     text: str,
 ) -> str:
@@ -171,79 +225,77 @@ def ics_escape(
 
 
 def clean_channel(
-    s: str,
+    text: str,
 ) -> str:
 
-    if not s:
+    if not text:
         return ""
 
-    s = re.sub(
+    text = re.sub(
         r"^\s*afspilles\s+på\s+",
         "",
-        s,
+        text,
         flags=re.IGNORECASE,
     ).strip()
 
-    s = re.sub(
+    text = re.sub(
         r"\bTV\s*2\b",
         "TV2",
-        s,
+        text,
         flags=re.IGNORECASE,
     )
 
-    s = re.sub(
+    text = re.sub(
         r"\bTV\s*3\b",
         "TV3",
-        s,
+        text,
         flags=re.IGNORECASE,
     )
 
-    s = re.sub(
+    text = re.sub(
         r"\s{2,}",
         " ",
-        s,
+        text,
     ).strip()
 
-    return s
+    return text
 
 
 def normalize_channel_key(
-    s: str,
+    text: str,
 ) -> str:
 
-    """
-    Normaliser kanalnavn til en stabil nøgle til sammenligning.
-    """
+    text = (
+        text or ""
+    ).strip().lower()
 
-    s = (s or "").strip().lower()
-
-    s = re.sub(
+    text = re.sub(
         r"\s{2,}",
         " ",
-        s,
+        text,
     )
 
-    s = s.replace(
+    text = text.replace(
         "tv 2",
         "tv2",
     )
 
-    s = s.replace(
+    text = text.replace(
         "tv 3",
         "tv3",
     )
 
-    s = s.replace(
+    text = text.replace(
         "dr 1",
         "dr1",
     )
 
-    s = s.replace(
+    text = text.replace(
         "dr 2",
         "dr2",
     )
 
-    return s
+    return text
 
 
 def is_allowed_channel(
@@ -251,19 +303,27 @@ def is_allowed_channel(
 ) -> bool:
 
     return (
-        normalize_channel_key(channel)
+        normalize_channel_key(
+            channel
+        )
         in ALLOWED_CHANNELS
     )
 
 
+# --------------------
+# SCRAPER
+# --------------------
+
 def scrape_cards_payload() -> List[dict]:
 
     """
-    Hent TV-programsiden.
+    Hent hele den synlige TV-programside.
 
-    Vi bruger bevidst BODY i stedet for en CSS/styling-baseret
-    card-selector. Samtidig udskriver vi diagnostik, så et CI-run
-    viser præcis hvad GitHub Actions modtager fra hjemmesiden.
+    Håndbold.dk har ikke længere den tidligere <main>-struktur,
+    så BODY bruges som datakilde.
+
+    Selve afgrænsningen mellem kampene sker efterfølgende i
+    parseren og ikke via hjemmesidens styling-klasser.
     """
 
     with sync_playwright() as p:
@@ -305,68 +365,59 @@ def scrape_cards_payload() -> List[dict]:
             f"Final URL: {page.url}"
         )
 
-        try:
-            title = page.title()
-        except Exception:
-            title = "<unable to read title>"
-
         print(
-            f"Page title: {title}"
+            f"Page title: {page.title()}"
         )
 
-        # Giv JavaScript tid til at bygge siden.
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(
+            5000
+        )
 
-        # Scroll gennem siden for eventuelt lazy-loaded indhold.
+        # Scroll siden for at sikre, at lazy-loaded indhold
+        # bliver hentet.
+
         previous_height = 0
 
         for _ in range(15):
 
-            try:
-                height = page.evaluate(
-                    "document.body ? "
-                    "document.body.scrollHeight : 0"
-                )
-            except Exception:
-                height = 0
+            height = page.evaluate(
+                """
+                document.body
+                    ? document.body.scrollHeight
+                    : 0
+                """
+            )
 
             if not height:
                 break
 
-            if height == previous_height:
-                # Scroll én ekstra gang, men vi behøver ikke
-                # fortsætte 30 gange på en stabil side.
-                page.evaluate(
-                    "window.scrollTo("
-                    "0, document.body.scrollHeight"
-                    ")"
+            page.evaluate(
+                """
+                window.scrollTo(
+                    0,
+                    document.body.scrollHeight
                 )
+                """
+            )
 
-                page.wait_for_timeout(1000)
+            page.wait_for_timeout(
+                1000
+            )
 
+            if height == previous_height:
                 break
 
             previous_height = height
 
-            page.evaluate(
-                "window.scrollTo("
-                "0, document.body.scrollHeight"
-                ")"
-            )
+        body_count = (
+            page.locator("body")
+            .count()
+        )
 
-            page.wait_for_timeout(1000)
-
-        # --------------------
-        # DIAGNOSTIK
-        # --------------------
-
-        body_count = page.locator(
-            "body"
-        ).count()
-
-        main_count = page.locator(
-            "main"
-        ).count()
+        main_count = (
+            page.locator("main")
+            .count()
+        )
 
         print(
             f"BODY elements: {body_count}"
@@ -378,156 +429,41 @@ def scrape_cards_payload() -> List[dict]:
 
         if body_count == 0:
 
-            html = page.content()
-
-            print(
-                f"HTML length: {len(html)}"
-            )
-
-            print(
-                "----- HTML PREVIEW -----"
-            )
-
-            print(
-                html[:5000]
-            )
-
-            print(
-                "----- END HTML PREVIEW -----"
-            )
-
             browser.close()
 
             raise RuntimeError(
-                "The TV programme page did not contain a BODY element."
+                "The TV programme page "
+                "did not contain a BODY element."
             )
 
-        body = page.locator(
-            "body"
-        )
-
-        try:
-            body_text = body.inner_text(
+        body_text = (
+            page.locator("body")
+            .inner_text(
                 timeout=10000
             )
-        except Exception as exc:
-
-            html = page.content()
-
-            print(
-                "Unable to read BODY innerText."
-            )
-
-            print(
-                f"Error: {exc}"
-            )
-
-            print(
-                f"HTML length: {len(html)}"
-            )
-
-            print(
-                "----- HTML PREVIEW -----"
-            )
-
-            print(
-                html[:5000]
-            )
-
-            print(
-                "----- END HTML PREVIEW -----"
-            )
-
-            browser.close()
-
-            raise
-
-        print(
-            f"Body text length: {len(body_text)}"
         )
 
         print(
-            "----- BODY PREVIEW -----"
+            f"Body text length: "
+            f"{len(body_text)}"
         )
 
-        print(
-            body_text[:5000]
-        )
-
-        print(
-            "----- END BODY PREVIEW -----"
-        )
-
-        # --------------------
-        # PAYLOAD
-        # --------------------
-
-        payload: List[dict] = (
-            page.eval_on_selector_all(
-                "body",
-                """
-                (els) => els.map(el => {
-                    const text =
-                        (el.innerText || "").trim();
-
-                    const alts =
-                        Array.from(
-                            el.querySelectorAll("img")
-                        )
-                        .map(img =>
-                            (
-                                img.getAttribute("alt")
-                                || ""
-                            ).trim()
-                        )
-                        .filter(Boolean);
-
-                    const aria =
-                        Array.from(
-                            el.querySelectorAll(
-                                "[aria-label]"
-                            )
-                        )
-                        .map(n =>
-                            (
-                                n.getAttribute(
-                                    "aria-label"
-                                )
-                                || ""
-                            ).trim()
-                        )
-                        .filter(Boolean);
-
-                    const uniq = (arr) =>
-                        Array.from(
-                            new Set(arr)
-                        );
-
-                    return {
-                        text,
-                        alts: uniq(alts),
-                        aria: uniq(aria)
-                    };
-                })
-                """,
-            )
-        )
-
-        print(
-            f"Payload elements: {len(payload)}"
-        )
+        payload = [
+            {
+                "text": body_text,
+                "alts": [],
+                "aria": [],
+            }
+        ]
 
         browser.close()
 
-        if not payload:
-
-            raise RuntimeError(
-                "Could not retrieve page BODY "
-                "from TV programme page."
-            )
-
         return payload
 
+
+# --------------------
+# NORMALISERING
+# --------------------
 
 def normalize_lines(
     text: str,
@@ -537,11 +473,14 @@ def normalize_lines(
 
     lines = [
         line.strip()
-        for line in (text or "").split("\n")
+        for line
+        in (text or "").split("\n")
         if line.strip()
     ]
 
-    for alt in (alts or []):
+    for alt in (
+        alts or []
+    ):
 
         if (
             alt
@@ -551,7 +490,9 @@ def normalize_lines(
                 alt
             )
 
-    for label in (aria or []):
+    for label in (
+        aria or []
+    ):
 
         if (
             label
@@ -564,58 +505,115 @@ def normalize_lines(
     return lines
 
 
-def find_channel(
-    lines_after_match: List[str],
-) -> str:
+# --------------------
+# KAMP-AFGRÆNSNING
+# --------------------
 
-    for row in lines_after_match:
+def collect_match_block(
+    lines: List[str],
+    match_index: int,
+) -> List[str]:
 
-        m = CHANNEL_RE.search(
-            row.strip()
+    """
+    Returnerer kun linjerne, der tilhører den aktuelle kamp.
+
+    Vi stopper ved:
+      - næste tidspunkt
+      - næste dato
+      - næste kamp
+
+    Dermed kan en kanal fra en senere kamp aldrig blive brugt
+    på den aktuelle kamp.
+    """
+
+    block: List[str] = []
+
+    for line in lines[
+        match_index + 1:
+    ]:
+
+        stripped = (
+            line or ""
+        ).strip()
+
+        if not stripped:
+            continue
+
+        if looks_like_weekday_date_header(
+            stripped
+        ):
+            break
+
+        if parse_time_line(
+            stripped
+        ):
+            break
+
+        if looks_like_match(
+            stripped
+        ):
+            break
+
+        block.append(
+            stripped
         )
 
-        if m:
+    return block
+
+
+def find_channel_in_block(
+    block: List[str],
+) -> str:
+
+    for line in block:
+
+        match = CHANNEL_RE.search(
+            line
+        )
+
+        if match:
+
             return clean_channel(
-                m.group(1)
+                match.group(1)
             )
 
     return ""
 
 
-def find_description(
-    lines_after_match: List[str],
+def find_description_in_block(
+    block: List[str],
 ) -> str:
 
-    for row in lines_after_match:
+    for line in block:
 
-        rr = row.strip()
+        stripped = (
+            line or ""
+        ).strip()
 
-        if not rr:
+        if not stripped:
             continue
-
-        if looks_like_weekday_date_header(
-            rr
-        ):
-            continue
-
-        if parse_time_line(
-            rr
-        ):
-            continue
-
-        # Næste kamp
-        if " - " in rr:
-            break
 
         if CHANNEL_RE.search(
-            rr
+            stripped
         ):
             continue
 
-        return rr
+        if (
+            stripped.lower()
+            .startswith(
+                "afspilles på"
+            )
+        ):
+            continue
+
+        return stripped
 
     return ""
 
+
+# --------------------
+# PARSER
+# --------------------
 
 def parse_payload_to_events(
     payload: List[dict],
@@ -627,6 +625,9 @@ def parse_payload_to_events(
 
     skipped_not_allowed = 0
     skipped_missing_channel = 0
+    total_matches_found = 0
+
+    skipped_channel_counts = {}
 
     for card in payload:
 
@@ -648,122 +649,201 @@ def parse_payload_to_events(
         if not lines:
             continue
 
-        current_date: Optional[date] = None
+        current_date: Optional[
+            date
+        ] = None
 
         current_time: Optional[
             tuple[int, int]
         ] = None
 
-        for i, line in enumerate(
+        for index, line in enumerate(
             lines
         ):
 
-            d = parse_date_line(
-                line,
-                year,
+            parsed_date = (
+                parse_date_line(
+                    line,
+                    year,
+                )
             )
 
-            if d:
-                current_date = d
+            if parsed_date:
+
+                current_date = (
+                    parsed_date
+                )
+
                 continue
 
-            t = parse_time_line(
+            parsed_time = (
+                parse_time_line(
+                    line
+                )
+            )
+
+            if parsed_time:
+
+                current_time = (
+                    parsed_time
+                )
+
+                continue
+
+            if not looks_like_match(
                 line
-            )
-
-            if t:
-                current_time = t
+            ):
                 continue
 
-            if (
-                " - " in line
-                and current_date
-                and current_time
-            ):
+            if not current_date:
+                continue
 
-                summary = line.strip()
+            if not current_time:
+                continue
 
-                rest = lines[
-                    i + 1:
-                ]
+            total_matches_found += 1
 
-                channel = find_channel(
-                    rest
+            summary = (
+                line.strip()
+            )
+
+            block = collect_match_block(
+                lines,
+                index,
+            )
+
+            channel = (
+                find_channel_in_block(
+                    block
                 )
+            )
 
-                # --------------------
-                # WHITELIST FILTER
-                # --------------------
-
-                if not channel.strip():
-
-                    skipped_missing_channel += 1
-
-                    current_time = None
-
-                    continue
-
-                if not is_allowed_channel(
-                    channel
-                ):
-
-                    skipped_not_allowed += 1
-
-                    current_time = None
-
-                    continue
-
-                desc = find_description(
-                    rest
+            description = (
+                find_description_in_block(
+                    block
                 )
+            )
 
-                start_dt = datetime(
-                    current_date.year,
-                    current_date.month,
-                    current_date.day,
-                    current_time[0],
-                    current_time[1],
-                )
+            if not channel:
 
-                end_dt = (
-                    start_dt
-                    + timedelta(
-                        minutes=DEFAULT_DURATION_MIN
-                    )
-                )
+                skipped_missing_channel += 1
 
-                events.append(
-                    Event(
-                        summary=summary,
-                        start=start_dt,
-                        end=end_dt,
-                        location=channel,
-                        description=desc,
-                    )
+                print(
+                    "SKIP missing channel: "
+                    f"{summary}"
                 )
 
                 current_time = None
 
+                continue
+
+            channel_key = (
+                normalize_channel_key(
+                    channel
+                )
+            )
+
+            if not is_allowed_channel(
+                channel
+            ):
+
+                skipped_not_allowed += 1
+
+                skipped_channel_counts[
+                    channel_key
+                ] = (
+                    skipped_channel_counts
+                    .get(
+                        channel_key,
+                        0,
+                    )
+                    + 1
+                )
+
+                print(
+                    "SKIP channel "
+                    f"{channel}: "
+                    f"{summary}"
+                )
+
+                current_time = None
+
+                continue
+
+            start_dt = datetime(
+                current_date.year,
+                current_date.month,
+                current_date.day,
+                current_time[0],
+                current_time[1],
+            )
+
+            end_dt = (
+                start_dt
+                + timedelta(
+                    minutes=(
+                        DEFAULT_DURATION_MIN
+                    )
+                )
+            )
+
+            events.append(
+                Event(
+                    summary=summary,
+                    start=start_dt,
+                    end=end_dt,
+                    location=channel,
+                    description=description,
+                )
+            )
+
+            current_time = None
+
+    print(
+        f"Total matches found: "
+        f"{total_matches_found}"
+    )
+
+    print(
+        f"Allowed events: "
+        f"{len(events)}"
+    )
+
+    print(
+        "Skipped "
+        "(not allowed channel): "
+        f"{skipped_not_allowed}"
+    )
+
+    print(
+        "Skipped "
+        "(missing channel): "
+        f"{skipped_missing_channel}"
+    )
+
+    if skipped_channel_counts:
+
+        print(
+            "Skipped channels:"
+        )
+
+        for (
+            channel,
+            count
+        ) in sorted(
+            skipped_channel_counts.items()
+        ):
+
+            print(
+                f"  {channel}: {count}"
+            )
+
     if not events:
 
-        print(
-            "Parsed events: 0"
-        )
-
-        print(
-            "Skipped (not allowed channel): "
-            f"{skipped_not_allowed}"
-        )
-
-        print(
-            "Skipped (missing channel): "
-            f"{skipped_missing_channel}"
-        )
-
         raise RuntimeError(
-            "No events were parsed "
-            "(or all were filtered). "
-            "See BODY PREVIEW above for diagnostics."
+            "No allowed events were parsed. "
+            "The site structure or channel "
+            "representation may have changed."
         )
 
     parse_payload_to_events.skipped_not_allowed = (
@@ -774,8 +854,16 @@ def parse_payload_to_events(
         skipped_missing_channel
     )
 
+    parse_payload_to_events.total_matches_found = (
+        total_matches_found
+    )
+
     return events
 
+
+# --------------------
+# ICS
+# --------------------
 
 def write_ics(
     events: List[Event],
@@ -794,18 +882,28 @@ def write_ics(
         "VERSION:2.0",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-SCRIPT-VERSION:2026-09-26-body-diagnostic-v8",
+        (
+            "X-SCRIPT-VERSION:"
+            "2026-09-26-match-boundaries-v9"
+        ),
 
         "BEGIN:VTIMEZONE",
         "TZID:Europe/Copenhagen",
-        "X-LIC-LOCATION:Europe/Copenhagen",
+        (
+            "X-LIC-LOCATION:"
+            "Europe/Copenhagen"
+        ),
 
         "BEGIN:DAYLIGHT",
         "TZOFFSETFROM:+0100",
         "TZOFFSETTO:+0200",
         "TZNAME:CEST",
         "DTSTART:19700329T020000",
-        "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU",
+        (
+            "RRULE:FREQ=YEARLY;"
+            "BYMONTH=3;"
+            "BYDAY=-1SU"
+        ),
         "END:DAYLIGHT",
 
         "BEGIN:STANDARD",
@@ -813,7 +911,11 @@ def write_ics(
         "TZOFFSETTO:+0100",
         "TZNAME:CET",
         "DTSTART:19701025T030000",
-        "RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU",
+        (
+            "RRULE:FREQ=YEARLY;"
+            "BYMONTH=10;"
+            "BYDAY=-1SU"
+        ),
         "END:STANDARD",
 
         "END:VTIMEZONE",
@@ -837,18 +939,24 @@ def write_ics(
 
                 (
                     f"UID:{uid}"
-                    "@danskhaandbold.tvprogram"
+                    "@danskhaandbold."
+                    "tvprogram"
                 ),
 
-                f"DTSTAMP:{now_utc}",
+                (
+                    f"DTSTAMP:"
+                    f"{now_utc}"
+                ),
 
                 (
-                    f"DTSTART;TZID={TZID}:"
+                    f"DTSTART;TZID="
+                    f"{TZID}:"
                     f"{event.start.strftime('%Y%m%dT%H%M%S')}"
                 ),
 
                 (
-                    f"DTEND;TZID={TZID}:"
+                    f"DTEND;TZID="
+                    f"{TZID}:"
                     f"{event.end.strftime('%Y%m%dT%H%M%S')}"
                 ),
 
@@ -888,6 +996,10 @@ def write_ics(
         )
 
 
+# --------------------
+# MAIN
+# --------------------
+
 if __name__ == "__main__":
 
     payload = (
@@ -916,22 +1028,35 @@ if __name__ == "__main__":
         0,
     )
 
-    print(
-        f"Generated {len(events)} events "
-        f"→ {OUT_FILE}"
+    total_matches_found = getattr(
+        parse_payload_to_events,
+        "total_matches_found",
+        0,
     )
 
     print(
-        "Skipped (not allowed channel): "
+        f"Generated {len(events)} "
+        f"events → {OUT_FILE}"
+    )
+
+    print(
+        f"Total matches found: "
+        f"{total_matches_found}"
+    )
+
+    print(
+        "Skipped "
+        "(not allowed channel): "
         f"{skipped_not_allowed}"
     )
 
     print(
-        "Skipped (missing channel): "
+        "Skipped "
+        "(missing channel): "
         f"{skipped_missing_channel}"
     )
 
-    missing_loc = sum(
+    missing_location = sum(
         1
         for event in events
         if not event.location.strip()
@@ -939,5 +1064,6 @@ if __name__ == "__main__":
 
     print(
         f"Missing LOCATION: "
-        f"{missing_loc} / {len(events)}"
+        f"{missing_location} / "
+        f"{len(events)}"
     )
