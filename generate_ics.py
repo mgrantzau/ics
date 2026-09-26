@@ -15,12 +15,29 @@ TZID = "Europe/Copenhagen"
 DEFAULT_DURATION_MIN = 90
 
 MONTHS = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "maj": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "okt": 10, "nov": 11, "dec": 12,
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "maj": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "okt": 10,
+    "nov": 11,
+    "dec": 12,
 }
 
-DATE_RE = re.compile(r"(\d{1,2})\.\s*([a-zæøå]+)", re.IGNORECASE)
-TIME_RE = re.compile(r"kl\.\s*(\d{1,2}):(\d{2})", re.IGNORECASE)
+DATE_RE = re.compile(
+    r"(\d{1,2})\.\s*([a-zæøå]+)",
+    re.IGNORECASE,
+)
+
+TIME_RE = re.compile(
+    r"kl\.\s*(\d{1,2}):(\d{2})",
+    re.IGNORECASE,
+)
 
 WEEKDAY_WORDS = {
     "mandag",
@@ -32,7 +49,8 @@ WEEKDAY_WORDS = {
     "søndag",
 }
 
-# VIGTIGT: længste/most-specific først, ellers bliver "TV2 Sport" til "TV2"
+# VIGTIGT:
+# Længste/most-specific først, ellers bliver "TV2 Sport" til "TV2".
 CHANNEL_PATTERNS = [
     r"TV2\s*Sport\s*X",
     r"TV2\s*Sport",
@@ -55,7 +73,8 @@ CHANNEL_RE = re.compile(
     + r")\b"
 )
 
-# Whitelist: kun disse kanaler må komme med i feedet
+# Whitelist:
+# Kun disse kanaler må komme med i feedet.
 ALLOWED_CHANNELS = {
     "tv2 sport",
     "tv2 sport x",
@@ -76,7 +95,11 @@ class Event:
     description: str
 
 
-def parse_date_line(line: str, assumed_year: int) -> Optional[date]:
+def parse_date_line(
+    line: str,
+    assumed_year: int,
+) -> Optional[date]:
+
     m = DATE_RE.search(line.lower())
 
     if not m:
@@ -84,24 +107,38 @@ def parse_date_line(line: str, assumed_year: int) -> Optional[date]:
 
     day = int(m.group(1))
     mon_key = m.group(2)[:3].lower()
+
     month = MONTHS.get(mon_key)
 
     if not month:
         return None
 
-    return date(assumed_year, month, day)
+    return date(
+        assumed_year,
+        month,
+        day,
+    )
 
 
-def parse_time_line(line: str) -> Optional[tuple[int, int]]:
+def parse_time_line(
+    line: str,
+) -> Optional[tuple[int, int]]:
+
     m = TIME_RE.search(line.lower())
 
     if not m:
         return None
 
-    return int(m.group(1)), int(m.group(2))
+    return (
+        int(m.group(1)),
+        int(m.group(2)),
+    )
 
 
-def looks_like_weekday_date_header(s: str) -> bool:
+def looks_like_weekday_date_header(
+    s: str,
+) -> bool:
+
     low = s.lower().strip()
 
     if not low:
@@ -115,10 +152,15 @@ def looks_like_weekday_date_header(s: str) -> bool:
     if words[0] not in WEEKDAY_WORDS:
         return False
 
-    return bool(DATE_RE.search(low))
+    return bool(
+        DATE_RE.search(low)
+    )
 
 
-def ics_escape(text: str) -> str:
+def ics_escape(
+    text: str,
+) -> str:
+
     return (
         (text or "")
         .replace("\\", "\\\\")
@@ -128,7 +170,10 @@ def ics_escape(text: str) -> str:
     )
 
 
-def clean_channel(s: str) -> str:
+def clean_channel(
+    s: str,
+) -> str:
+
     if not s:
         return ""
 
@@ -153,115 +198,332 @@ def clean_channel(s: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    s = re.sub(r"\s{2,}", " ", s).strip()
+    s = re.sub(
+        r"\s{2,}",
+        " ",
+        s,
+    ).strip()
 
     return s
 
 
-def normalize_channel_key(s: str) -> str:
+def normalize_channel_key(
+    s: str,
+) -> str:
+
     """
     Normaliser kanalnavn til en stabil nøgle til sammenligning.
     """
+
     s = (s or "").strip().lower()
-    s = re.sub(r"\s{2,}", " ", s)
 
-    s = s.replace("tv 2", "tv2")
-    s = s.replace("tv 3", "tv3")
+    s = re.sub(
+        r"\s{2,}",
+        " ",
+        s,
+    )
 
-    s = s.replace("dr 1", "dr1")
-    s = s.replace("dr 2", "dr2")
+    s = s.replace(
+        "tv 2",
+        "tv2",
+    )
+
+    s = s.replace(
+        "tv 3",
+        "tv3",
+    )
+
+    s = s.replace(
+        "dr 1",
+        "dr1",
+    )
+
+    s = s.replace(
+        "dr 2",
+        "dr2",
+    )
 
     return s
 
 
-def is_allowed_channel(channel: str) -> bool:
-    return normalize_channel_key(channel) in ALLOWED_CHANNELS
+def is_allowed_channel(
+    channel: str,
+) -> bool:
+
+    return (
+        normalize_channel_key(channel)
+        in ALLOWED_CHANNELS
+    )
 
 
 def scrape_cards_payload() -> List[dict]:
-    """
-    Scrape TV-programmet uden at være afhængig af hjemmesidens
-    styling-klasser.
 
-    Hele <main> hentes som én payload. Den eksisterende parser
-    finder derefter dato, tidspunkt, kamp og kanal.
     """
+    Hent TV-programsiden.
+
+    Vi bruger bevidst BODY i stedet for en CSS/styling-baseret
+    card-selector. Samtidig udskriver vi diagnostik, så et CI-run
+    viser præcis hvad GitHub Actions modtager fra hjemmesiden.
+    """
+
     with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
 
-        page.goto(
-            URL,
-            wait_until="networkidle",
+        browser = p.chromium.launch()
+
+        page = browser.new_page(
+            viewport={
+                "width": 1440,
+                "height": 1200,
+            },
+            user_agent=(
+                "Mozilla/5.0 "
+                "(Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140.0.0.0 "
+                "Safari/537.36"
+            ),
         )
 
-        page.wait_for_timeout(2500)
+        response = page.goto(
+            URL,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
 
-        # Scroll gennem siden så eventuelt lazy-loaded indhold bliver hentet.
+        status = (
+            response.status
+            if response
+            else "no response"
+        )
+
+        print(
+            f"HTTP status: {status}"
+        )
+
+        print(
+            f"Final URL: {page.url}"
+        )
+
+        try:
+            title = page.title()
+        except Exception:
+            title = "<unable to read title>"
+
+        print(
+            f"Page title: {title}"
+        )
+
+        # Giv JavaScript tid til at bygge siden.
+        page.wait_for_timeout(5000)
+
+        # Scroll gennem siden for eventuelt lazy-loaded indhold.
         previous_height = 0
 
-        for _ in range(30):
-            height = page.evaluate(
-                "document.body.scrollHeight"
-            )
+        for _ in range(15):
+
+            try:
+                height = page.evaluate(
+                    "document.body ? "
+                    "document.body.scrollHeight : 0"
+                )
+            except Exception:
+                height = 0
+
+            if not height:
+                break
 
             if height == previous_height:
+                # Scroll én ekstra gang, men vi behøver ikke
+                # fortsætte 30 gange på en stabil side.
+                page.evaluate(
+                    "window.scrollTo("
+                    "0, document.body.scrollHeight"
+                    ")"
+                )
+
+                page.wait_for_timeout(1000)
+
                 break
 
             previous_height = height
 
             page.evaluate(
-                "window.scrollTo(0, document.body.scrollHeight)"
+                "window.scrollTo("
+                "0, document.body.scrollHeight"
+                ")"
             )
 
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(1000)
 
-        # Vi bruger kun den semantiske <main>-container.
-        # Dermed er scraperen ikke afhængig af Tailwind/styling-klasser.
-        page.wait_for_selector(
-            "main",
-            timeout=15000,
+        # --------------------
+        # DIAGNOSTIK
+        # --------------------
+
+        body_count = page.locator(
+            "body"
+        ).count()
+
+        main_count = page.locator(
+            "main"
+        ).count()
+
+        print(
+            f"BODY elements: {body_count}"
         )
 
-        payload: List[dict] = page.eval_on_selector_all(
-            "main",
-            """
-            (els) => els.map(el => {
-              const text = (el.innerText || "").trim();
+        print(
+            f"MAIN elements: {main_count}"
+        )
 
-              const alts = Array.from(
-                el.querySelectorAll("img")
-              )
-                .map(img =>
-                  (img.getAttribute("alt") || "").trim()
-                )
-                .filter(Boolean);
+        if body_count == 0:
 
-              const aria = Array.from(
-                el.querySelectorAll("[aria-label]")
-              )
-                .map(n =>
-                  (n.getAttribute("aria-label") || "").trim()
-                )
-                .filter(Boolean);
+            html = page.content()
 
-              const uniq = (arr) =>
-                Array.from(new Set(arr));
+            print(
+                f"HTML length: {len(html)}"
+            )
 
-              return {
-                text,
-                alts: uniq(alts),
-                aria: uniq(aria)
-              };
-            })
-            """,
+            print(
+                "----- HTML PREVIEW -----"
+            )
+
+            print(
+                html[:5000]
+            )
+
+            print(
+                "----- END HTML PREVIEW -----"
+            )
+
+            browser.close()
+
+            raise RuntimeError(
+                "The TV programme page did not contain a BODY element."
+            )
+
+        body = page.locator(
+            "body"
+        )
+
+        try:
+            body_text = body.inner_text(
+                timeout=10000
+            )
+        except Exception as exc:
+
+            html = page.content()
+
+            print(
+                "Unable to read BODY innerText."
+            )
+
+            print(
+                f"Error: {exc}"
+            )
+
+            print(
+                f"HTML length: {len(html)}"
+            )
+
+            print(
+                "----- HTML PREVIEW -----"
+            )
+
+            print(
+                html[:5000]
+            )
+
+            print(
+                "----- END HTML PREVIEW -----"
+            )
+
+            browser.close()
+
+            raise
+
+        print(
+            f"Body text length: {len(body_text)}"
+        )
+
+        print(
+            "----- BODY PREVIEW -----"
+        )
+
+        print(
+            body_text[:5000]
+        )
+
+        print(
+            "----- END BODY PREVIEW -----"
+        )
+
+        # --------------------
+        # PAYLOAD
+        # --------------------
+
+        payload: List[dict] = (
+            page.eval_on_selector_all(
+                "body",
+                """
+                (els) => els.map(el => {
+                    const text =
+                        (el.innerText || "").trim();
+
+                    const alts =
+                        Array.from(
+                            el.querySelectorAll("img")
+                        )
+                        .map(img =>
+                            (
+                                img.getAttribute("alt")
+                                || ""
+                            ).trim()
+                        )
+                        .filter(Boolean);
+
+                    const aria =
+                        Array.from(
+                            el.querySelectorAll(
+                                "[aria-label]"
+                            )
+                        )
+                        .map(n =>
+                            (
+                                n.getAttribute(
+                                    "aria-label"
+                                )
+                                || ""
+                            ).trim()
+                        )
+                        .filter(Boolean);
+
+                    const uniq = (arr) =>
+                        Array.from(
+                            new Set(arr)
+                        );
+
+                    return {
+                        text,
+                        alts: uniq(alts),
+                        aria: uniq(aria)
+                    };
+                })
+                """,
+            )
+        )
+
+        print(
+            f"Payload elements: {len(payload)}"
         )
 
         browser.close()
 
         if not payload:
+
             raise RuntimeError(
-                "Could not find <main> on the TV programme page."
+                "Could not retrieve page BODY "
+                "from TV programme page."
             )
 
         return payload
@@ -274,50 +536,80 @@ def normalize_lines(
 ) -> List[str]:
 
     lines = [
-        l.strip()
-        for l in (text or "").split("\n")
-        if l.strip()
+        line.strip()
+        for line in (text or "").split("\n")
+        if line.strip()
     ]
 
-    for a in (alts or []):
-        if a and a not in lines:
-            lines.append(a)
+    for alt in (alts or []):
 
-    for a in (aria or []):
-        if a and a not in lines:
-            lines.append(a)
+        if (
+            alt
+            and alt not in lines
+        ):
+            lines.append(
+                alt
+            )
+
+    for label in (aria or []):
+
+        if (
+            label
+            and label not in lines
+        ):
+            lines.append(
+                label
+            )
 
     return lines
 
 
-def find_channel(lines_after_match: List[str]) -> str:
-    for r in lines_after_match:
-        m = CHANNEL_RE.search(r.strip())
+def find_channel(
+    lines_after_match: List[str],
+) -> str:
+
+    for row in lines_after_match:
+
+        m = CHANNEL_RE.search(
+            row.strip()
+        )
 
         if m:
-            return clean_channel(m.group(1))
+            return clean_channel(
+                m.group(1)
+            )
 
     return ""
 
 
-def find_description(lines_after_match: List[str]) -> str:
-    for r in lines_after_match:
-        rr = r.strip()
+def find_description(
+    lines_after_match: List[str],
+) -> str:
+
+    for row in lines_after_match:
+
+        rr = row.strip()
 
         if not rr:
             continue
 
-        if looks_like_weekday_date_header(rr):
+        if looks_like_weekday_date_header(
+            rr
+        ):
             continue
 
-        if parse_time_line(rr):
+        if parse_time_line(
+            rr
+        ):
             continue
 
         # Næste kamp
         if " - " in rr:
             break
 
-        if CHANNEL_RE.search(rr):
+        if CHANNEL_RE.search(
+            rr
+        ):
             continue
 
         return rr
@@ -330,25 +622,41 @@ def parse_payload_to_events(
 ) -> List[Event]:
 
     year = datetime.now().year
+
     events: List[Event] = []
 
     skipped_not_allowed = 0
     skipped_missing_channel = 0
 
     for card in payload:
+
         lines = normalize_lines(
-            card.get("text", ""),
-            card.get("alts", []),
-            card.get("aria", []),
+            card.get(
+                "text",
+                "",
+            ),
+            card.get(
+                "alts",
+                [],
+            ),
+            card.get(
+                "aria",
+                [],
+            ),
         )
 
         if not lines:
             continue
 
         current_date: Optional[date] = None
-        current_time: Optional[tuple[int, int]] = None
 
-        for i, line in enumerate(lines):
+        current_time: Optional[
+            tuple[int, int]
+        ] = None
+
+        for i, line in enumerate(
+            lines
+        ):
 
             d = parse_date_line(
                 line,
@@ -359,7 +667,9 @@ def parse_payload_to_events(
                 current_date = d
                 continue
 
-            t = parse_time_line(line)
+            t = parse_time_line(
+                line
+            )
 
             if t:
                 current_time = t
@@ -370,26 +680,42 @@ def parse_payload_to_events(
                 and current_date
                 and current_time
             ):
-                summary = line.strip()
-                rest = lines[i + 1:]
 
-                channel = find_channel(rest)
+                summary = line.strip()
+
+                rest = lines[
+                    i + 1:
+                ]
+
+                channel = find_channel(
+                    rest
+                )
 
                 # --------------------
                 # WHITELIST FILTER
                 # --------------------
 
                 if not channel.strip():
+
                     skipped_missing_channel += 1
+
                     current_time = None
+
                     continue
 
-                if not is_allowed_channel(channel):
+                if not is_allowed_channel(
+                    channel
+                ):
+
                     skipped_not_allowed += 1
+
                     current_time = None
+
                     continue
 
-                desc = find_description(rest)
+                desc = find_description(
+                    rest
+                )
 
                 start_dt = datetime(
                     current_date.year,
@@ -399,8 +725,11 @@ def parse_payload_to_events(
                     current_time[1],
                 )
 
-                end_dt = start_dt + timedelta(
-                    minutes=DEFAULT_DURATION_MIN
+                end_dt = (
+                    start_dt
+                    + timedelta(
+                        minutes=DEFAULT_DURATION_MIN
+                    )
                 )
 
                 events.append(
@@ -416,12 +745,27 @@ def parse_payload_to_events(
                 current_time = None
 
     if not events:
-        raise RuntimeError(
-            "No events were parsed (or all were filtered). "
-            "The site structure may have changed."
+
+        print(
+            "Parsed events: 0"
         )
 
-    # Gem counts til print
+        print(
+            "Skipped (not allowed channel): "
+            f"{skipped_not_allowed}"
+        )
+
+        print(
+            "Skipped (missing channel): "
+            f"{skipped_missing_channel}"
+        )
+
+        raise RuntimeError(
+            "No events were parsed "
+            "(or all were filtered). "
+            "See BODY PREVIEW above for diagnostics."
+        )
+
     parse_payload_to_events.skipped_not_allowed = (
         skipped_not_allowed
     )
@@ -433,9 +777,15 @@ def parse_payload_to_events(
     return events
 
 
-def write_ics(events: List[Event]) -> None:
-    now_utc = datetime.utcnow().strftime(
-        "%Y%m%dT%H%M%SZ"
+def write_ics(
+    events: List[Event],
+) -> None:
+
+    now_utc = (
+        datetime.utcnow()
+        .strftime(
+            "%Y%m%dT%H%M%SZ"
+        )
     )
 
     lines = [
@@ -444,7 +794,7 @@ def write_ics(events: List[Event]) -> None:
         "VERSION:2.0",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-SCRIPT-VERSION:2026-09-26-main-parser-v7",
+        "X-SCRIPT-VERSION:2026-09-26-body-diagnostic-v8",
 
         "BEGIN:VTIMEZONE",
         "TZID:Europe/Copenhagen",
@@ -469,10 +819,11 @@ def write_ics(events: List[Event]) -> None:
         "END:VTIMEZONE",
     ]
 
-    for e in events:
+    for event in events:
 
         uid_basis = (
-            f"{e.start.isoformat()}|{e.summary}"
+            f"{event.start.isoformat()}"
+            f"|{event.summary}"
         )
 
         uid = uuid.uuid5(
@@ -484,27 +835,36 @@ def write_ics(events: List[Event]) -> None:
             [
                 "BEGIN:VEVENT",
 
-                f"UID:{uid}@danskhaandbold.tvprogram",
+                (
+                    f"UID:{uid}"
+                    "@danskhaandbold.tvprogram"
+                ),
 
                 f"DTSTAMP:{now_utc}",
 
                 (
                     f"DTSTART;TZID={TZID}:"
-                    f"{e.start.strftime('%Y%m%dT%H%M%S')}"
+                    f"{event.start.strftime('%Y%m%dT%H%M%S')}"
                 ),
 
                 (
                     f"DTEND;TZID={TZID}:"
-                    f"{e.end.strftime('%Y%m%dT%H%M%S')}"
+                    f"{event.end.strftime('%Y%m%dT%H%M%S')}"
                 ),
 
-                f"SUMMARY:{ics_escape(e.summary)}",
-
-                f"LOCATION:{ics_escape(e.location)}",
+                (
+                    "SUMMARY:"
+                    f"{ics_escape(event.summary)}"
+                ),
 
                 (
-                    f"DESCRIPTION:"
-                    f"{ics_escape(e.description)}"
+                    "LOCATION:"
+                    f"{ics_escape(event.location)}"
+                ),
+
+                (
+                    "DESCRIPTION:"
+                    f"{ics_escape(event.description)}"
                 ),
 
                 "END:VEVENT",
@@ -519,18 +879,25 @@ def write_ics(events: List[Event]) -> None:
         OUT_FILE,
         "w",
         encoding="utf-8",
-    ) as f:
-        f.write(
-            "\n".join(lines)
+    ) as file:
+
+        file.write(
+            "\n".join(
+                lines
+            )
         )
 
 
 if __name__ == "__main__":
 
-    payload = scrape_cards_payload()
+    payload = (
+        scrape_cards_payload()
+    )
 
-    events = parse_payload_to_events(
-        payload
+    events = (
+        parse_payload_to_events(
+            payload
+        )
     )
 
     write_ics(
@@ -550,7 +917,8 @@ if __name__ == "__main__":
     )
 
     print(
-        f"Generated {len(events)} events → {OUT_FILE}"
+        f"Generated {len(events)} events "
+        f"→ {OUT_FILE}"
     )
 
     print(
@@ -565,8 +933,8 @@ if __name__ == "__main__":
 
     missing_loc = sum(
         1
-        for e in events
-        if not e.location.strip()
+        for event in events
+        if not event.location.strip()
     )
 
     print(
