@@ -56,11 +56,9 @@ WEEKDAY_WORDS = {
 }
 
 
-# Alle kendte kanaler/platforme.
-#
-# Vi skal også kunne identificere kanaler, som IKKE er tilladt.
-# Ellers risikerer vi at knytte en senere TV2-kanal til en
-# tidligere kamp.
+# ============================================================
+# CHANNELS
+# ============================================================
 
 CHANNEL_PATTERNS = [
     r"Ekstra\s*Bladet\+",
@@ -84,13 +82,11 @@ CHANNEL_PATTERNS = [
 
 
 CHANNEL_RE = re.compile(
-    r"(?i)\b(?:afspilles\s+på\s+)?("
+    r"(?i)(?:afspilles\s+på\s+)?("
     + "|".join(CHANNEL_PATTERNS)
-    + r")\b"
+    + r")"
 )
 
-
-# Kun disse kommer med i kalenderen.
 
 ALLOWED_CHANNELS = {
     "tv2",
@@ -126,7 +122,7 @@ def parse_date_line(
 ) -> Optional[date]:
 
     match = DATE_RE.search(
-        line.lower()
+        (line or "").lower()
     )
 
     if not match:
@@ -164,7 +160,7 @@ def parse_time_line(
 ) -> Optional[tuple[int, int]]:
 
     match = TIME_RE.search(
-        line.lower()
+        (line or "").lower()
     )
 
     if not match:
@@ -200,6 +196,57 @@ def looks_like_weekday_date_header(
     )
 
 
+# ============================================================
+# MATCH DETECTION
+# ============================================================
+
+def looks_like_competition_text(
+    text: str,
+) -> bool:
+
+    """
+    Frasorterer tekster, som indeholder ' - ', men som tydeligt
+    er turnerings-/rundeangivelser og ikke holdnavne.
+
+    Eksempel:
+        Pokalturnering Kvinder 2025 - 1/4-finaler
+    """
+
+    low = (
+        text or ""
+    ).strip().lower()
+
+    competition_words = [
+        "finaler",
+        "finale",
+        "semifinale",
+        "semifinaler",
+        "kvartfinale",
+        "kvartfinaler",
+        "1/4-final",
+        "1/8-final",
+        "gruppespil",
+        "indl. grupper",
+        "indledende grupper",
+        "pokalturnering",
+    ]
+
+    if any(
+        word in low
+        for word in competition_words
+    ):
+        return True
+
+    # Årstal efterfulgt af bindestreg og rundeangivelse.
+    if re.search(
+        r"\b20\d{2}\s+-\s+\d+/\d+",
+        low,
+    ):
+        return True
+
+    return False
+
+
 def looks_like_match(
     text: str,
 ) -> bool:
@@ -219,11 +266,31 @@ def looks_like_match(
     ):
         return False
 
+    if looks_like_competition_text(
+        text
+    ):
+        return False
+
+    left, right = text.split(
+        " - ",
+        1,
+    )
+
+    left = left.strip()
+    right = right.strip()
+
+    if not left or not right:
+        return False
+
+    # En kamp skal have reel tekst på begge sider.
+    if len(left) < 2 or len(right) < 2:
+        return False
+
     return True
 
 
 # ============================================================
-# CHANNELS
+# CHANNEL HELPERS
 # ============================================================
 
 def clean_channel(
@@ -305,13 +372,15 @@ def is_allowed_channel(
 ) -> bool:
 
     return (
-        normalize_channel_key(channel)
+        normalize_channel_key(
+            channel
+        )
         in ALLOWED_CHANNELS
     )
 
 
 # ============================================================
-# ICS
+# ICS HELPERS
 # ============================================================
 
 def ics_escape(
@@ -334,29 +403,10 @@ def ics_escape(
 def scrape_ordered_payload() -> List[str]:
 
     """
-    Hent TV-programmet som en sekventiel liste.
+    Hent TV-programmet i DOM-rækkefølge.
 
-    Vigtigt:
-
-    innerText alene indeholder ikke nødvendigvis kanalnavnet,
-    fordi kanalnavnet kan ligge i IMG alt-attributten.
-
-    Derfor gennemgår JavaScript DOM'en i dokumentrækkefølge.
-
-    Tekstnoder bliver lagt ind som almindelige linjer.
-
-    IMG-elementer med alt-tekst bliver lagt ind på PRÆCIS den
-    position i rækkefølgen, hvor billedet forekommer.
-
-    Det betyder, at:
-
-        dato
-        tidspunkt
-        kamp
-        beskrivelse
-        afspilles på TV2 Sport
-
-    bevarer den faktiske rækkefølge fra hjemmesiden.
+    Tekstnoder og IMG alt-attributter placeres i samme sekvens,
+    så kanal-logoets alt-tekst bliver ved den kamp, det tilhører.
     """
 
     with sync_playwright() as playwright:
@@ -408,10 +458,7 @@ def scrape_ordered_payload() -> List[str]:
             5000
         )
 
-        # ----------------------------------------------------
-        # LAZY LOADING
-        # ----------------------------------------------------
-
+        # Lazy-loaded content
         previous_height = 0
 
         for _ in range(15):
@@ -472,10 +519,6 @@ def scrape_ordered_payload() -> List[str]:
                 "did not contain a BODY element."
             )
 
-        # ----------------------------------------------------
-        # ORDERED DOM EXTRACTION
-        # ----------------------------------------------------
-
         ordered_lines: List[str] = (
             page.evaluate(
                 """
@@ -495,7 +538,7 @@ def scrape_ordered_payload() -> List[str]:
 
                         const parts = value
                             .split(/\\n+/)
-                            .map(v => v.trim())
+                            .map(value => value.trim())
                             .filter(Boolean);
 
                         for (const part of parts) {
@@ -593,7 +636,6 @@ def scrape_ordered_payload() -> List[str]:
 
         browser.close()
 
-        # Fjern tomme linjer og direkte dubletter.
         cleaned: List[str] = []
 
         for line in ordered_lines:
@@ -605,6 +647,7 @@ def scrape_ordered_payload() -> List[str]:
             if not line:
                 continue
 
+            # Kun direkte dubletter fjernes her.
             if (
                 cleaned
                 and cleaned[-1] == line
@@ -627,37 +670,30 @@ def scrape_ordered_payload() -> List[str]:
                 "could be extracted."
             )
 
-        # Begrænset diagnostik.
-        #
-        # Vi udskriver relevante linjer omkring TV-programmet
-        # uden at dumpe hele siden.
-
         print(
             "----- RELEVANT DOM PREVIEW -----"
         )
 
-        preview_started = False
         preview_count = 0
 
         for line in cleaned:
 
-            if (
-                "TV" in line
-                or "kl." in line.lower()
+            relevant = (
+                looks_like_weekday_date_header(line)
+                or parse_time_line(line)
                 or looks_like_match(line)
-                or looks_like_weekday_date_header(line)
                 or "afspilles" in line.lower()
-            ):
-                preview_started = True
+            )
 
-            if preview_started:
+            if not relevant:
+                continue
 
-                print(line)
+            print(line)
 
-                preview_count += 1
+            preview_count += 1
 
-                if preview_count >= 80:
-                    break
+            if preview_count >= 80:
+                break
 
         print(
             "----- END DOM PREVIEW -----"
@@ -676,14 +712,7 @@ def collect_match_block(
 ) -> List[str]:
 
     """
-    Saml kun data, der tilhører den aktuelle kamp.
-
-    Stop ved næste:
-      - dato
-      - tidspunkt
-      - kamp
-
-    Derfor kan en kanal fra en senere kamp ikke blive brugt.
+    Samler kun data frem til næste kamp/dato/tid.
     """
 
     block: List[str] = []
@@ -760,14 +789,10 @@ def find_description_in_block(
 
         if (
             line.lower()
-            .startswith(
-                "afspilles på"
-            )
+            .startswith("afspilles på")
         ):
             continue
 
-        # Logo-alt kan indeholde andre irrelevante
-        # beskrivelser. Undgå de mest oplagte.
         if (
             line.lower()
             .startswith("logo")
@@ -777,6 +802,35 @@ def find_description_in_block(
         return line
 
     return ""
+
+
+# ============================================================
+# EVENT KEY
+# ============================================================
+
+def event_key(
+    event_date: date,
+    event_time: tuple[int, int],
+    summary: str,
+) -> tuple:
+
+    """
+    Stabil deduplikeringsnøgle.
+
+    Samme kamp på samme dato og tidspunkt må kun behandles én gang,
+    selv om hjemmesiden indeholder flere responsive versioner.
+    """
+
+    return (
+        event_date.isoformat(),
+        event_time[0],
+        event_time[1],
+        re.sub(
+            r"\s+",
+            " ",
+            summary.strip().lower(),
+        ),
+    )
 
 
 # ============================================================
@@ -799,33 +853,37 @@ def parse_lines_to_events(
         tuple[int, int]
     ] = None
 
-    total_matches_found = 0
+    total_candidates = 0
+    unique_matches = 0
+
+    skipped_duplicates = 0
     skipped_not_allowed = 0
     skipped_missing_channel = 0
 
     skipped_channel_counts = {}
 
+    seen_matches = set()
+
     for index, line in enumerate(
         lines
     ):
 
-        parsed_date = (
-            parse_date_line(
-                line,
-                year,
-            )
-        )
-
-        if (
-            parsed_date
-            and looks_like_weekday_date_header(
-                line
-            )
+        if looks_like_weekday_date_header(
+            line
         ):
 
-            current_date = (
-                parsed_date
+            parsed_date = (
+                parse_date_line(
+                    line,
+                    year,
+                )
             )
+
+            if parsed_date:
+
+                current_date = (
+                    parsed_date
+                )
 
             continue
 
@@ -854,11 +912,36 @@ def parse_lines_to_events(
         if not current_time:
             continue
 
-        total_matches_found += 1
+        total_candidates += 1
 
         summary = (
             line.strip()
         )
+
+        key = event_key(
+            current_date,
+            current_time,
+            summary,
+        )
+
+        if key in seen_matches:
+
+            skipped_duplicates += 1
+
+            print(
+                "SKIP duplicate: "
+                f"{summary}"
+            )
+
+            current_time = None
+
+            continue
+
+        seen_matches.add(
+            key
+        )
+
+        unique_matches += 1
 
         block = collect_match_block(
             lines,
@@ -967,18 +1050,25 @@ def parse_lines_to_events(
 
         current_time = None
 
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
+    print(
+        f"Candidate matches: "
+        f"{total_candidates}"
+    )
 
     print(
-        f"Total matches found: "
-        f"{total_matches_found}"
+        f"Unique matches: "
+        f"{unique_matches}"
     )
 
     print(
         f"Allowed events: "
         f"{len(events)}"
+    )
+
+    print(
+        "Skipped "
+        "(duplicates): "
+        f"{skipped_duplicates}"
     )
 
     print(
@@ -1014,11 +1104,19 @@ def parse_lines_to_events(
 
         raise RuntimeError(
             "No allowed events were parsed. "
-            "See the DOM diagnostics above."
+            "See diagnostics above."
         )
 
-    parse_lines_to_events.total_matches_found = (
-        total_matches_found
+    parse_lines_to_events.total_candidates = (
+        total_candidates
+    )
+
+    parse_lines_to_events.unique_matches = (
+        unique_matches
+    )
+
+    parse_lines_to_events.skipped_duplicates = (
+        skipped_duplicates
     )
 
     parse_lines_to_events.skipped_not_allowed = (
@@ -1055,7 +1153,7 @@ def write_ics(
         "METHOD:PUBLISH",
         (
             "X-SCRIPT-VERSION:"
-            "2026-09-26-ordered-dom-v10"
+            "2026-09-26-ordered-dom-v11"
         ),
 
         "BEGIN:VTIMEZONE",
@@ -1184,9 +1282,21 @@ if __name__ == "__main__":
         events
     )
 
-    total_matches_found = getattr(
+    total_candidates = getattr(
         parse_lines_to_events,
-        "total_matches_found",
+        "total_candidates",
+        0,
+    )
+
+    unique_matches = getattr(
+        parse_lines_to_events,
+        "unique_matches",
+        0,
+    )
+
+    skipped_duplicates = getattr(
+        parse_lines_to_events,
+        "skipped_duplicates",
         0,
     )
 
@@ -1202,6 +1312,12 @@ if __name__ == "__main__":
         0,
     )
 
+    missing_location = sum(
+        1
+        for event in events
+        if not event.location.strip()
+    )
+
     print(
         "================================"
     )
@@ -1212,8 +1328,18 @@ if __name__ == "__main__":
     )
 
     print(
-        f"Total matches found: "
-        f"{total_matches_found}"
+        f"Candidate matches: "
+        f"{total_candidates}"
+    )
+
+    print(
+        f"Unique matches: "
+        f"{unique_matches}"
+    )
+
+    print(
+        "Skipped (duplicates): "
+        f"{skipped_duplicates}"
     )
 
     print(
@@ -1226,12 +1352,6 @@ if __name__ == "__main__":
         "Skipped "
         "(missing channel): "
         f"{skipped_missing_channel}"
-    )
-
-    missing_location = sum(
-        1
-        for event in events
-        if not event.location.strip()
     )
 
     print(
