@@ -40,7 +40,7 @@ DATE_RE = re.compile(
 
 
 TIME_RE = re.compile(
-    r"kl\.\s*(\d{1,2}):(\d{2})",
+    r"^kl\.\s*(\d{1,2}):(\d{2})$",
     re.IGNORECASE,
 )
 
@@ -112,8 +112,17 @@ class Event:
     description: str
 
 
+@dataclass
+class Candidate:
+    event_date: date
+    event_time: tuple[int, int]
+    summary: str
+    description: str
+    channel: str
+
+
 # ============================================================
-# BASIC PARSING
+# BASIC HELPERS
 # ============================================================
 
 def parse_date_line(
@@ -121,8 +130,20 @@ def parse_date_line(
     assumed_year: int,
 ) -> Optional[date]:
 
+    text = (
+        line or ""
+    ).strip().lower()
+
+    words = text.split()
+
+    if not words:
+        return None
+
+    if words[0] not in WEEKDAY_WORDS:
+        return None
+
     match = DATE_RE.search(
-        (line or "").lower()
+        text
     )
 
     if not match:
@@ -159,8 +180,8 @@ def parse_time_line(
     line: str,
 ) -> Optional[tuple[int, int]]:
 
-    match = TIME_RE.search(
-        (line or "").lower()
+    match = TIME_RE.match(
+        (line or "").strip()
     )
 
     if not match:
@@ -172,126 +193,30 @@ def parse_time_line(
     )
 
 
-def looks_like_weekday_date_header(
-    text: str,
+def is_date_line(
+    line: str,
 ) -> bool:
 
-    text = (
-        text or ""
-    ).strip().lower()
-
-    if not text:
-        return False
-
-    words = text.split()
-
-    if not words:
-        return False
-
-    if words[0] not in WEEKDAY_WORDS:
-        return False
-
-    return bool(
-        DATE_RE.search(text)
+    return (
+        parse_date_line(
+            line,
+            datetime.now().year,
+        )
+        is not None
     )
 
 
-# ============================================================
-# MATCH DETECTION
-# ============================================================
-
-def looks_like_competition_text(
-    text: str,
+def is_channel_line(
+    line: str,
 ) -> bool:
 
-    """
-    Frasorterer tekster, som indeholder ' - ', men som tydeligt
-    er turnerings-/rundeangivelser og ikke holdnavne.
-
-    Eksempel:
-        Pokalturnering Kvinder 2025 - 1/4-finaler
-    """
-
-    low = (
-        text or ""
-    ).strip().lower()
-
-    competition_words = [
-        "finaler",
-        "finale",
-        "semifinale",
-        "semifinaler",
-        "kvartfinale",
-        "kvartfinaler",
-        "1/4-final",
-        "1/8-final",
-        "gruppespil",
-        "indl. grupper",
-        "indledende grupper",
-        "pokalturnering",
-    ]
-
-    if any(
-        word in low
-        for word in competition_words
-    ):
-        return True
-
-    # Årstal efterfulgt af bindestreg og rundeangivelse.
-    if re.search(
-        r"\b20\d{2}\s+-\s+\d+/\d+",
-        low,
-    ):
-        return True
-
-    return False
-
-
-def looks_like_match(
-    text: str,
-) -> bool:
-
-    text = (
-        text or ""
-    ).strip()
-
-    if not text:
-        return False
-
-    if " - " not in text:
-        return False
-
-    if looks_like_weekday_date_header(
-        text
-    ):
-        return False
-
-    if looks_like_competition_text(
-        text
-    ):
-        return False
-
-    left, right = text.split(
-        " - ",
-        1,
+    return (
+        CHANNEL_RE.search(
+            (line or "").strip()
+        )
+        is not None
     )
 
-    left = left.strip()
-    right = right.strip()
-
-    if not left or not right:
-        return False
-
-    # En kamp skal have reel tekst på begge sider.
-    if len(left) < 2 or len(right) < 2:
-        return False
-
-    return True
-
-
-# ============================================================
-# CHANNEL HELPERS
-# ============================================================
 
 def clean_channel(
     text: str,
@@ -379,10 +304,6 @@ def is_allowed_channel(
     )
 
 
-# ============================================================
-# ICS HELPERS
-# ============================================================
-
 def ics_escape(
     text: str,
 ) -> str:
@@ -403,10 +324,10 @@ def ics_escape(
 def scrape_ordered_payload() -> List[str]:
 
     """
-    Hent TV-programmet i DOM-rækkefølge.
+    Hent tekst og IMG-alt-attributter i faktisk DOM-rækkefølge.
 
-    Tekstnoder og IMG alt-attributter placeres i samme sekvens,
-    så kanal-logoets alt-tekst bliver ved den kamp, det tilhører.
+    Kanal-logoets alt-attribut bevares dermed på samme sted
+    i sekvensen som den kamp, logoet tilhører.
     """
 
     with sync_playwright() as playwright:
@@ -458,7 +379,10 @@ def scrape_ordered_payload() -> List[str]:
             5000
         )
 
-        # Lazy-loaded content
+        # ----------------------------------------------------
+        # LAZY LOADING
+        # ----------------------------------------------------
+
         previous_height = 0
 
         for _ in range(15):
@@ -516,8 +440,12 @@ def scrape_ordered_payload() -> List[str]:
 
             raise RuntimeError(
                 "The TV programme page "
-                "did not contain a BODY element."
+                "did not contain BODY."
             )
+
+        # ----------------------------------------------------
+        # ORDERED DOM
+        # ----------------------------------------------------
 
         ordered_lines: List[str] = (
             page.evaluate(
@@ -538,7 +466,7 @@ def scrape_ordered_payload() -> List[str]:
 
                         const parts = value
                             .split(/\\n+/)
-                            .map(value => value.trim())
+                            .map(v => v.trim())
                             .filter(Boolean);
 
                         for (const part of parts) {
@@ -636,90 +564,9 @@ def scrape_ordered_payload() -> List[str]:
 
         browser.close()
 
-        cleaned: List[str] = []
+    cleaned: List[str] = []
 
-        for line in ordered_lines:
-
-            line = (
-                line or ""
-            ).strip()
-
-            if not line:
-                continue
-
-            # Kun direkte dubletter fjernes her.
-            if (
-                cleaned
-                and cleaned[-1] == line
-            ):
-                continue
-
-            cleaned.append(
-                line
-            )
-
-        print(
-            f"Ordered DOM lines: "
-            f"{len(cleaned)}"
-        )
-
-        if not cleaned:
-
-            raise RuntimeError(
-                "No ordered DOM content "
-                "could be extracted."
-            )
-
-        print(
-            "----- RELEVANT DOM PREVIEW -----"
-        )
-
-        preview_count = 0
-
-        for line in cleaned:
-
-            relevant = (
-                looks_like_weekday_date_header(line)
-                or parse_time_line(line)
-                or looks_like_match(line)
-                or "afspilles" in line.lower()
-            )
-
-            if not relevant:
-                continue
-
-            print(line)
-
-            preview_count += 1
-
-            if preview_count >= 80:
-                break
-
-        print(
-            "----- END DOM PREVIEW -----"
-        )
-
-        return cleaned
-
-
-# ============================================================
-# MATCH BLOCK
-# ============================================================
-
-def collect_match_block(
-    lines: List[str],
-    match_index: int,
-) -> List[str]:
-
-    """
-    Samler kun data frem til næste kamp/dato/tid.
-    """
-
-    block: List[str] = []
-
-    for line in lines[
-        match_index + 1:
-    ]:
+    for line in ordered_lines:
 
         line = (
             line or ""
@@ -728,29 +575,144 @@ def collect_match_block(
         if not line:
             continue
 
-        if looks_like_weekday_date_header(
-            line
+        if (
+            cleaned
+            and cleaned[-1] == line
         ):
-            break
+            continue
 
-        if parse_time_line(
-            line
-        ):
-            break
-
-        if looks_like_match(
-            line
-        ):
-            break
-
-        block.append(
+        cleaned.append(
             line
         )
 
-    return block
+    print(
+        f"Ordered DOM lines: "
+        f"{len(cleaned)}"
+    )
+
+    if not cleaned:
+
+        raise RuntimeError(
+            "No ordered DOM content "
+            "could be extracted."
+        )
+
+    return cleaned
 
 
-def find_channel_in_block(
+# ============================================================
+# BLOCK EXTRACTION
+# ============================================================
+
+def extract_date_time_blocks(
+    lines: List[str],
+) -> List[tuple]:
+
+    """
+    Opdel DOM-sekvensen efter:
+
+        dato
+        tidspunkt
+
+    Hver forekomst af dato+tid bliver én rå blok.
+
+    Siden indeholder typisk to responsive repræsentationer
+    af samme kamp. Det håndteres senere ved deduplikering.
+    """
+
+    year = datetime.now().year
+
+    blocks = []
+
+    current_date: Optional[
+        date
+    ] = None
+
+    index = 0
+
+    while index < len(lines):
+
+        line = lines[index]
+
+        parsed_date = (
+            parse_date_line(
+                line,
+                year,
+            )
+        )
+
+        if parsed_date:
+
+            current_date = (
+                parsed_date
+            )
+
+            index += 1
+
+            continue
+
+        parsed_time = (
+            parse_time_line(
+                line
+            )
+        )
+
+        if (
+            parsed_time
+            and current_date
+        ):
+
+            content = []
+
+            cursor = (
+                index + 1
+            )
+
+            while cursor < len(lines):
+
+                next_line = (
+                    lines[cursor]
+                )
+
+                if parse_date_line(
+                    next_line,
+                    year,
+                ):
+                    break
+
+                if parse_time_line(
+                    next_line
+                ):
+                    break
+
+                content.append(
+                    next_line
+                )
+
+                cursor += 1
+
+            blocks.append(
+                (
+                    current_date,
+                    parsed_time,
+                    content,
+                )
+            )
+
+            index = cursor
+
+            continue
+
+        index += 1
+
+    return blocks
+
+
+# ============================================================
+# BLOCK ANALYSIS
+# ============================================================
+
+def find_channel(
     block: List[str],
 ) -> str:
 
@@ -769,67 +731,347 @@ def find_channel_in_block(
     return ""
 
 
-def find_description_in_block(
+def remove_channel_lines(
     block: List[str],
-) -> str:
+) -> List[str]:
+
+    result = []
 
     for line in block:
 
-        line = (
-            line or ""
-        ).strip()
-
-        if not line:
-            continue
-
-        if CHANNEL_RE.search(
+        if is_channel_line(
             line
         ):
             continue
 
-        if (
-            line.lower()
-            .startswith("afspilles på")
+        result.append(
+            line
+        )
+
+    return result
+
+
+def looks_like_competition(
+    text: str,
+) -> bool:
+
+    low = (
+        text or ""
+    ).strip().lower()
+
+    words = [
+        "ligaen",
+        "herreligaen",
+        "kvindeligaen",
+        "champions league",
+        "european league",
+        "euro cup",
+        "klub vm",
+        "pokalturnering",
+        "gruppespil",
+        "semifinale",
+        "semifinaler",
+        "finale",
+        "bronzekamp",
+        "1/4-final",
+        "1/8-final",
+        "indl. grupper",
+        "indledende grupper",
+    ]
+
+    return any(
+        word in low
+        for word in words
+    )
+
+
+def reconstruct_fragmented_match(
+    content: List[str],
+) -> Optional[str]:
+
+    """
+    Første responsive variant kan være:
+
+        turnering
+        hold 1
+        -
+        hold 2
+
+    Denne funktion kan rekonstruere kampen.
+
+    Den bruges primært som fallback.
+    """
+
+    for index, line in enumerate(
+        content
+    ):
+
+        if line.strip() != "-":
+            continue
+
+        if index == 0:
+            continue
+
+        if index + 1 >= len(content):
+            continue
+
+        left = (
+            content[index - 1]
+            .strip()
+        )
+
+        right = (
+            content[index + 1]
+            .strip()
+        )
+
+        if not left or not right:
+            continue
+
+        if is_channel_line(left):
+            continue
+
+        if is_channel_line(right):
+            continue
+
+        return (
+            f"{left} - {right}"
+        )
+
+    return None
+
+
+def find_complete_match_line(
+    content: List[str],
+) -> Optional[str]:
+
+    """
+    Den foretrukne responsive variant har allerede kampen som
+    én samlet tekstlinje.
+
+    Vi vælger en sådan linje, men undgår turneringsbeskrivelser.
+    """
+
+    candidates = []
+
+    for line in content:
+
+        text = (
+            line or ""
+        ).strip()
+
+        if " - " not in text:
+            continue
+
+        if is_channel_line(
+            text
         ):
             continue
 
-        if (
-            line.lower()
-            .startswith("logo")
+        if looks_like_competition(
+            text
         ):
             continue
 
-        return line
+        left, right = text.rsplit(
+            " - ",
+            1,
+        )
+
+        if not left.strip():
+            continue
+
+        if not right.strip():
+            continue
+
+        candidates.append(
+            text
+        )
+
+    if not candidates:
+        return None
+
+    # Hvis et holdnavn selv indeholder " - ", er den længste
+    # samlede linje normalt den komplette kamp:
+    #
+    # OTP Bank - PICK Szeged (HUN) - GOG
+    #
+    # frem for:
+    #
+    # OTP Bank - PICK Szeged (HUN)
+
+    return max(
+        candidates,
+        key=len,
+    )
+
+
+def find_description(
+    content: List[str],
+    summary: str,
+) -> str:
+
+    for line in content:
+
+        text = (
+            line or ""
+        ).strip()
+
+        if not text:
+            continue
+
+        if text == summary:
+            continue
+
+        if text == "-":
+            continue
+
+        if is_channel_line(
+            text
+        ):
+            continue
+
+        if looks_like_competition(
+            text
+        ):
+            return text
 
     return ""
 
 
-# ============================================================
-# EVENT KEY
-# ============================================================
-
-def event_key(
+def block_to_candidate(
     event_date: date,
     event_time: tuple[int, int],
-    summary: str,
+    raw_content: List[str],
+) -> Optional[Candidate]:
+
+    channel = find_channel(
+        raw_content
+    )
+
+    content = remove_channel_lines(
+        raw_content
+    )
+
+    summary = (
+        find_complete_match_line(
+            content
+        )
+    )
+
+    if not summary:
+
+        summary = (
+            reconstruct_fragmented_match(
+                content
+            )
+        )
+
+    if not summary:
+        return None
+
+    description = (
+        find_description(
+            content,
+            summary,
+        )
+    )
+
+    return Candidate(
+        event_date=event_date,
+        event_time=event_time,
+        summary=summary,
+        description=description,
+        channel=channel,
+    )
+
+
+# ============================================================
+# CANDIDATE QUALITY / DEDUPLICATION
+# ============================================================
+
+def normalize_summary(
+    text: str,
+) -> str:
+
+    return re.sub(
+        r"\s+",
+        " ",
+        (text or "")
+        .strip()
+        .lower(),
+    )
+
+
+def candidate_key(
+    candidate: Candidate,
+) -> tuple:
+
+    return (
+        candidate.event_date.isoformat(),
+        candidate.event_time[0],
+        candidate.event_time[1],
+        normalize_summary(
+            candidate.summary
+        ),
+    )
+
+
+def candidate_quality(
+    candidate: Candidate,
 ) -> tuple:
 
     """
-    Stabil deduplikeringsnøgle.
+    Hvis to responsive varianter giver samme kamp, foretrækkes:
 
-    Samme kamp på samme dato og tidspunkt må kun behandles én gang,
-    selv om hjemmesiden indeholder flere responsive versioner.
+    1. kandidat med kanal
+    2. kandidat med beskrivelse
+    3. længste summary som sidste sikkerhedsnet
     """
 
     return (
-        event_date.isoformat(),
-        event_time[0],
-        event_time[1],
-        re.sub(
-            r"\s+",
-            " ",
-            summary.strip().lower(),
-        ),
+        1 if candidate.channel else 0,
+        1 if candidate.description else 0,
+        len(candidate.summary),
+    )
+
+
+def deduplicate_candidates(
+    candidates: List[Candidate],
+) -> List[Candidate]:
+
+    selected = {}
+
+    for candidate in candidates:
+
+        key = candidate_key(
+            candidate
+        )
+
+        existing = selected.get(
+            key
+        )
+
+        if existing is None:
+
+            selected[key] = (
+                candidate
+            )
+
+            continue
+
+        if (
+            candidate_quality(candidate)
+            >
+            candidate_quality(existing)
+        ):
+
+            selected[key] = (
+                candidate
+            )
+
+    return list(
+        selected.values()
     )
 
 
@@ -841,156 +1083,97 @@ def parse_lines_to_events(
     lines: List[str],
 ) -> List[Event]:
 
-    year = datetime.now().year
+    blocks = (
+        extract_date_time_blocks(
+            lines
+        )
+    )
+
+    print(
+        f"Date/time blocks: "
+        f"{len(blocks)}"
+    )
+
+    raw_candidates: List[
+        Candidate
+    ] = []
+
+    ignored_blocks = 0
+
+    for (
+        event_date,
+        event_time,
+        content,
+    ) in blocks:
+
+        candidate = (
+            block_to_candidate(
+                event_date,
+                event_time,
+                content,
+            )
+        )
+
+        if not candidate:
+
+            ignored_blocks += 1
+
+            continue
+
+        raw_candidates.append(
+            candidate
+        )
+
+    print(
+        f"Raw candidates: "
+        f"{len(raw_candidates)}"
+    )
+
+    print(
+        f"Ignored blocks: "
+        f"{ignored_blocks}"
+    )
+
+    candidates = (
+        deduplicate_candidates(
+            raw_candidates
+        )
+    )
+
+    print(
+        f"Unique candidates: "
+        f"{len(candidates)}"
+    )
 
     events: List[Event] = []
 
-    current_date: Optional[
-        date
-    ] = None
-
-    current_time: Optional[
-        tuple[int, int]
-    ] = None
-
-    total_candidates = 0
-    unique_matches = 0
-
-    skipped_duplicates = 0
     skipped_not_allowed = 0
     skipped_missing_channel = 0
 
     skipped_channel_counts = {}
 
-    seen_matches = set()
+    for candidate in candidates:
 
-    for index, line in enumerate(
-        lines
-    ):
-
-        if looks_like_weekday_date_header(
-            line
-        ):
-
-            parsed_date = (
-                parse_date_line(
-                    line,
-                    year,
-                )
-            )
-
-            if parsed_date:
-
-                current_date = (
-                    parsed_date
-                )
-
-            continue
-
-        parsed_time = (
-            parse_time_line(
-                line
-            )
-        )
-
-        if parsed_time:
-
-            current_time = (
-                parsed_time
-            )
-
-            continue
-
-        if not looks_like_match(
-            line
-        ):
-            continue
-
-        if not current_date:
-            continue
-
-        if not current_time:
-            continue
-
-        total_candidates += 1
-
-        summary = (
-            line.strip()
-        )
-
-        key = event_key(
-            current_date,
-            current_time,
-            summary,
-        )
-
-        if key in seen_matches:
-
-            skipped_duplicates += 1
-
-            print(
-                "SKIP duplicate: "
-                f"{summary}"
-            )
-
-            current_time = None
-
-            continue
-
-        seen_matches.add(
-            key
-        )
-
-        unique_matches += 1
-
-        block = collect_match_block(
-            lines,
-            index,
-        )
-
-        channel = (
-            find_channel_in_block(
-                block
-            )
-        )
-
-        description = (
-            find_description_in_block(
-                block
-            )
-        )
-
-        if not channel:
+        if not candidate.channel:
 
             skipped_missing_channel += 1
 
             print(
                 "SKIP missing channel: "
-                f"{summary}"
+                f"{candidate.summary}"
             )
-
-            if block:
-
-                print(
-                    "  Block: "
-                    + " | ".join(
-                        block[:10]
-                    )
-                )
-
-            current_time = None
 
             continue
 
         if not is_allowed_channel(
-            channel
+            candidate.channel
         ):
 
             skipped_not_allowed += 1
 
             channel_key = (
                 normalize_channel_key(
-                    channel
+                    candidate.channel
                 )
             )
 
@@ -1007,20 +1190,18 @@ def parse_lines_to_events(
 
             print(
                 "SKIP channel "
-                f"{channel}: "
-                f"{summary}"
+                f"{candidate.channel}: "
+                f"{candidate.summary}"
             )
-
-            current_time = None
 
             continue
 
         start_dt = datetime(
-            current_date.year,
-            current_date.month,
-            current_date.day,
-            current_time[0],
-            current_time[1],
+            candidate.event_date.year,
+            candidate.event_date.month,
+            candidate.event_date.day,
+            candidate.event_time[0],
+            candidate.event_time[1],
         )
 
         end_dt = (
@@ -1032,43 +1213,33 @@ def parse_lines_to_events(
             )
         )
 
+        event = Event(
+            summary=(
+                candidate.summary
+            ),
+            start=start_dt,
+            end=end_dt,
+            location=(
+                candidate.channel
+            ),
+            description=(
+                candidate.description
+            ),
+        )
+
         events.append(
-            Event(
-                summary=summary,
-                start=start_dt,
-                end=end_dt,
-                location=channel,
-                description=description,
-            )
+            event
         )
 
         print(
             "ADD "
-            f"{summary} "
-            f"[{channel}]"
+            f"{event.summary} "
+            f"[{event.location}]"
         )
-
-        current_time = None
-
-    print(
-        f"Candidate matches: "
-        f"{total_candidates}"
-    )
-
-    print(
-        f"Unique matches: "
-        f"{unique_matches}"
-    )
 
     print(
         f"Allowed events: "
         f"{len(events)}"
-    )
-
-    print(
-        "Skipped "
-        "(duplicates): "
-        f"{skipped_duplicates}"
     )
 
     print(
@@ -1103,20 +1274,19 @@ def parse_lines_to_events(
     if not events:
 
         raise RuntimeError(
-            "No allowed events were parsed. "
-            "See diagnostics above."
+            "No allowed events were parsed."
         )
 
-    parse_lines_to_events.total_candidates = (
-        total_candidates
+    parse_lines_to_events.blocks = (
+        len(blocks)
     )
 
-    parse_lines_to_events.unique_matches = (
-        unique_matches
+    parse_lines_to_events.raw_candidates = (
+        len(raw_candidates)
     )
 
-    parse_lines_to_events.skipped_duplicates = (
-        skipped_duplicates
+    parse_lines_to_events.unique_candidates = (
+        len(candidates)
     )
 
     parse_lines_to_events.skipped_not_allowed = (
@@ -1153,7 +1323,7 @@ def write_ics(
         "METHOD:PUBLISH",
         (
             "X-SCRIPT-VERSION:"
-            "2026-09-26-ordered-dom-v11"
+            "2026-09-26-structured-blocks-v12"
         ),
 
         "BEGIN:VTIMEZONE",
@@ -1282,21 +1452,21 @@ if __name__ == "__main__":
         events
     )
 
-    total_candidates = getattr(
+    blocks = getattr(
         parse_lines_to_events,
-        "total_candidates",
+        "blocks",
         0,
     )
 
-    unique_matches = getattr(
+    raw_candidates = getattr(
         parse_lines_to_events,
-        "unique_matches",
+        "raw_candidates",
         0,
     )
 
-    skipped_duplicates = getattr(
+    unique_candidates = getattr(
         parse_lines_to_events,
-        "skipped_duplicates",
+        "unique_candidates",
         0,
     )
 
@@ -1328,18 +1498,18 @@ if __name__ == "__main__":
     )
 
     print(
-        f"Candidate matches: "
-        f"{total_candidates}"
+        f"Date/time blocks: "
+        f"{blocks}"
     )
 
     print(
-        f"Unique matches: "
-        f"{unique_matches}"
+        f"Raw candidates: "
+        f"{raw_candidates}"
     )
 
     print(
-        "Skipped (duplicates): "
-        f"{skipped_duplicates}"
+        f"Unique candidates: "
+        f"{unique_candidates}"
     )
 
     print(
